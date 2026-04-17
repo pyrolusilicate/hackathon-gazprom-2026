@@ -109,7 +109,7 @@ class LayoutRouter:
         global_image_counter = 1
         scale_factor = 72 / 300  # Для конвертации 300 DPI в 72 DPI PDF
 
-        print(f"\n🗺️ Анализ: {os.path.basename(pdf_path)} (ID: {doc_id})")
+        print(f"\nАнализ: {os.path.basename(pdf_path)} (ID: {doc_id})")
 
         for page_num, page in enumerate(doc):
             pix = page.get_pixmap(dpi=300)
