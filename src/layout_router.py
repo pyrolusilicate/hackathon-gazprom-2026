@@ -14,7 +14,9 @@ from device import get_torch_device, setup_environment
 import torch
 
 _original_load = torch.load
-torch.load = lambda *args, **kwargs: _original_load(*args, **{**kwargs, 'weights_only': False})
+torch.load = lambda *args, **kwargs: _original_load(
+    *args, **{**kwargs, "weights_only": False}
+)
 
 setup_environment()
 
