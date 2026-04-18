@@ -11,8 +11,14 @@ from PIL import Image
 
 from device import get_torch_device, setup_environment
 
+import torch
+
+_original_load = torch.load
+torch.load = lambda *args, **kwargs: _original_load(*args, **{**kwargs, 'weights_only': False})
+
 setup_environment()
 
+weights_name_file = "doclayout_yolo_docstructbench_imgsz1280_2501.pt"
 
 class LayoutRouter:
     def __init__(self, weights_dir: str = "weights"):
@@ -45,12 +51,12 @@ class LayoutRouter:
     def _load_model(self) -> YOLOv10:
         os.makedirs(self.weights_dir, exist_ok=True)
         weights_path = os.path.join(
-            self.weights_dir, "doclayout_yolo_docstructbench_imgsz1024.pt"
+            self.weights_dir, weights_name_file
         )
         if not os.path.exists(weights_path):
             hf_hub_download(
                 repo_id="juliozhao/DocLayout-YOLO-DocStructBench",
-                filename="doclayout_yolo_docstructbench_imgsz1024.pt",
+                filename=weights_name_file,
                 local_dir=self.weights_dir,
             )
         return YOLOv10(weights_path)
@@ -332,7 +338,7 @@ class LayoutRouter:
 
             # Обрати внимание: предикт делаем на очищенном img_cv2_denoised!
             results = self.model.predict(
-                img_cv2_denoised, imgsz=1024, conf=0.12, device=self.device, verbose=False
+                img_cv2_denoised, imgsz=1400, conf=0.165, device=self.device, verbose=False
             )[0]
 
             if visualize and vis_dir:

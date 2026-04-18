@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "accelerate>=1.0.0",
+    "dill>=0.4.1",
     "doclayout-yolo>=0.0.4",
     "easyocr>=1.7.0",
     "huggingface-hub>=1.11.0",
