@@ -19,15 +19,17 @@ import fitz
 import numpy as np
 from PIL import Image
 
-# Слой YOLO работает при 400 DPI — все coords в плане именно в этих пикселях.
-RENDER_DPI = 400
-PDF_DPI = 72.0
-_PX_TO_PT = PDF_DPI / RENDER_DPI
+from config import PDF_DPI, PDF_TO_LAYOUT
 
 
 def _to_pdf_rect(coords_px: list) -> tuple[float, float, float, float]:
     x1, y1, x2, y2 = coords_px
-    return (x1 * _PX_TO_PT, y1 * _PX_TO_PT, x2 * _PX_TO_PT, y2 * _PX_TO_PT)
+    return (
+        x1 * PDF_TO_LAYOUT,
+        y1 * PDF_TO_LAYOUT,
+        x2 * PDF_TO_LAYOUT,
+        y2 * PDF_TO_LAYOUT,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -38,9 +40,19 @@ def _to_pdf_rect(coords_px: list) -> tuple[float, float, float, float]:
 def extract_text_block(
     pdf_doc: fitz.Document, page_num: int, coords: list
 ) -> tuple[str, float]:
-    """Возвращает (text, avg_font_size) для bbox страницы (coords в пикселях 400 DPI)."""
+    """Возвращает (text, avg_font_size) для bbox страницы (coords в пикселях 300 DPI)."""
     page = pdf_doc[page_num]
-    rect = fitz.Rect(*_to_pdf_rect(coords))
+
+    # 1. Получаем строгие координаты от YOLO
+    x0, y0, x1, y1 = _to_pdf_rect(coords)
+
+    # 2. ДОБАВЛЯЕМ PADDING (В PDF-пунктах)
+    # Расширяем рамку по бокам (чтобы спасти длинные слова) и по вертикали (для букв "у", "р")
+    pad_x = 5.0
+    pad_y = 3.0
+
+    rect = fitz.Rect(x0 - pad_x, y0 - pad_y, x1 + pad_x, y1 + pad_y)
+
     text_dict = page.get_text("dict", clip=rect)
 
     lines, sizes = [], []
@@ -64,13 +76,17 @@ def has_vector_text(
 ) -> bool:
     """True, если в bbox страницы есть текстовый слой PDF."""
     page = pdf_doc[page_num]
-    rect = fitz.Rect(*_to_pdf_rect(coords))
+
+    x0, y0, x1, y1 = _to_pdf_rect(coords)
+    # Здесь тоже добавляем padding, чтобы детектор вектора не сбоил на краях
+    rect = fitz.Rect(x0 - 5.0, y0 - 3.0, x1 + 5.0, y1 + 3.0)
+
     text = page.get_text("text", clip=rect) or ""
     return len(text.strip()) >= min_chars
 
 
 def render_block_image(
-    pdf_doc: fitz.Document, page_num: int, coords: list, dpi: int = 300
+    pdf_doc: fitz.Document, page_num: int, coords: list, dpi: int = PDF_DPI
 ) -> Image.Image:
     """Рендерит bbox страницы в PIL Image с заданным DPI (для VLM-инференса)."""
     page = pdf_doc[page_num]
@@ -123,8 +139,8 @@ class DoclingTableStore:
     Однократная конвертация PDF через Docling. Таблицы индексируются по странице,
     каждая ищется по IoU bbox.
 
-    Docling bbox хранятся в PDF points. У нас coords YOLO-блока в пикселях 400 DPI —
-    конвертим в PDF points (×72/400) и считаем IoU.
+    Docling bbox хранятся в PDF points. У нас coords YOLO-блока в пикселях 300 DPI —
+    конвертим в PDF points (×72/300) и считаем IoU.
     """
 
     def __init__(self, pdf_path: str):

@@ -10,6 +10,7 @@ from doclayout_yolo import YOLOv10
 from huggingface_hub import hf_hub_download
 from PIL import Image
 
+from config import LAYOUT_DPI, LAYOUT_TO_PDF, PDF_TO_LAYOUT
 from device import get_torch_device, setup_environment
 
 _original_load = torch.load
@@ -345,10 +346,8 @@ class LayoutRouter:
         }
         global_image_counter = 1
 
-        print(f"\nАнализ: {os.path.basename(pdf_path)} (ID: {doc_id})")
-
         for page_num, page in enumerate(doc):
-            pix = page.get_pixmap(dpi=300)
+            pix = page.get_pixmap(dpi=LAYOUT_DPI)
             img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
                 pix.height, pix.width, pix.n
             )
@@ -524,10 +523,10 @@ class LayoutRouter:
                 for box in sorted_boxes:
                     coords = [int(c) for c in box.xyxy[0].tolist()]
                     yolo_rect = fitz.Rect(
-                        coords[0] * (72 / 400),
-                        coords[1] * (72 / 400),
-                        coords[2] * (72 / 400),
-                        coords[3] * (72 / 400),
+                        coords[0] * (PDF_TO_LAYOUT),
+                        coords[1] * (PDF_TO_LAYOUT),
+                        coords[2] * (PDF_TO_LAYOUT),
+                        coords[3] * (PDF_TO_LAYOUT),
                     )
                     if (
                         yolo_rect.intersect(img_rect).get_area()
@@ -538,10 +537,10 @@ class LayoutRouter:
 
                 if not is_caught_by_yolo:
                     missed_coords = [
-                        int(img_rect.x0 * (400 / 72)),
-                        int(img_rect.y0 * (400 / 72)),
-                        int(img_rect.x1 * (400 / 72)),
-                        int(img_rect.y1 * (400 / 72)),
+                        int(img_rect.x0 * (LAYOUT_TO_PDF)),
+                        int(img_rect.y0 * (LAYOUT_TO_PDF)),
+                        int(img_rect.x1 * (LAYOUT_TO_PDF)),
+                        int(img_rect.y1 * (LAYOUT_TO_PDF)),
                     ]
 
                     missed_coords = [
