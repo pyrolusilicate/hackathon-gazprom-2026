@@ -52,34 +52,162 @@ class LayoutRouter:
         except ValueError:
             return base_name.replace(".pdf", "")
 
-    def _sort_reading_order(self, boxes: list, page_width: float) -> list:
+    def _sort_reading_order(self, boxes: list, page_width: float, page_height: float) -> list:
+        if not boxes:
+            return []
+
         parsed_boxes = []
         for box in boxes:
             coords = box.xyxy[0].tolist()
+            cls_name = self.model.names[int(box.cls[0])].lower()
             parsed_boxes.append(
                 {
                     "box": box,
+                    "x1": coords[0],
                     "y1": coords[1],
+                    "x2": coords[2],
+                    "y2": coords[3],
                     "w": coords[2] - coords[0],
-                    "center_x": (coords[0] + coords[2]) / 2,
+                    "h": coords[3] - coords[1],
+                    "cls": cls_name
                 }
             )
 
-        full_width, left_col, right_col = [], [], []
+        # 1. Фильтрация колонтитулов
+        filtered_boxes = []
+        margin_top = page_height * 0.05
+        margin_bottom = page_height * 0.95
+        
+        for b in parsed_boxes:
+            if b["cls"] in ["text", "title", "page-header", "page-footer"]:
+                if b["y2"] < margin_top or b["y1"] > margin_bottom:
+                    continue
+            filtered_boxes.append(b)
 
-        for item in parsed_boxes:
-            if item["w"] > page_width * 0.6:
-                full_width.append(item)
-            elif item["center_x"] < page_width / 2:
-                left_col.append(item)
+        # Первичная сортировка сверху вниз
+        filtered_boxes.sort(key=lambda x: x["y1"])
+
+        # 2. ЛОГИЧЕСКАЯ ПРЕ-СКЛЕЙКА (Figure + Caption)
+        # Связываем медиа-объекты с их подписями в единые неразрывные блоки
+        logical_blocks = []
+        used_indices = set()
+
+        for i, b in enumerate(filtered_boxes):
+            if i in used_indices:
+                continue
+                
+            current_logical = [b]
+            used_indices.add(i)
+            
+            base_box = b
+            for j in range(i + 1, len(filtered_boxes)):
+                if j in used_indices:
+                    continue
+                next_box = filtered_boxes[j]
+                
+                # Расстояние по вертикали (если пересекаются, gap отрицательный)
+                y_gap = next_box["y1"] - base_box["y2"]
+                
+                # Доля пересечения по X
+                overlap_x = max(0, min(base_box["x2"], next_box["x2"]) - max(base_box["x1"], next_box["x1"]))
+                min_w = min(base_box["w"], next_box["w"])
+                x_ratio = overlap_x / min_w if min_w > 0 else 0
+                
+                is_caption = next_box["cls"] in ["figure_caption", "table_caption", "caption"]
+                is_parent_media = base_box["cls"] in ["figure", "picture", "image", "table", "table_merged", "table_borderless"]
+                
+                # Если блок находится близко под текущим (< 8% высоты страницы) и сильно выровнен по ширине
+                if y_gap < page_height * 0.08 and x_ratio > 0.5:
+                    # Склеиваем, если это картинка/таблица и текст под ней, либо если это явно подпись
+                    if is_caption or is_parent_media:
+                        current_logical.append(next_box)
+                        used_indices.add(j)
+                        base_box = next_box # Сдвигаем низ для цепочки
+                    else:
+                        break # Два обычных абзаца текста не склеиваем жестко
+                elif y_gap >= page_height * 0.08:
+                    pass # Ушли слишком далеко вниз
+                    
+            # Формируем габариты объединенного логического блока
+            logical_blocks.append({
+                "boxes": current_logical,
+                "x1": min(cb["x1"] for cb in current_logical),
+                "y1": min(cb["y1"] for cb in current_logical),
+                "x2": max(cb["x2"] for cb in current_logical),
+                "y2": max(cb["y2"] for cb in current_logical),
+                "w": max(cb["x2"] for cb in current_logical) - min(cb["x1"] for cb in current_logical),
+                "h": max(cb["y2"] for cb in current_logical) - min(cb["y1"] for cb in current_logical),
+            })
+
+        # Вспомогательные функции для работы с объединенными блоками
+        def get_y_overlap_ratio(b1, b2):
+            overlap = max(0, min(b1["y2"], b2["y2"]) - max(b1["y1"], b2["y1"]))
+            min_h = min(b1["h"], b2["h"])
+            return overlap / min_h if min_h > 0 else 0
+
+        def get_x_overlap_ratio(b1, b2):
+            overlap = max(0, min(b1["x2"], b2["x2"]) - max(b1["x1"], b2["x1"]))
+            min_w = min(b1["w"], b2["w"])
+            return overlap / min_w if min_w > 0 else 0
+
+        # 3. Группируем логические блоки в горизонтальные полосы (Bands)
+        bands = []
+        current_band = []
+
+        for lb in logical_blocks:
+            is_full_width = lb["w"] > page_width * 0.55
+            
+            if is_full_width:
+                if current_band:
+                    bands.append(current_band)
+                    current_band = []
+                bands.append([lb])
             else:
-                right_col.append(item)
+                if not current_band:
+                    current_band.append(lb)
+                else:
+                    if any(get_y_overlap_ratio(lb, cb) > 0.1 for cb in current_band):
+                        current_band.append(lb)
+                    else:
+                        bands.append(current_band)
+                        current_band = [lb]
+                        
+        if current_band:
+            bands.append(current_band)
 
-        full_width.sort(key=lambda x: x["y1"])
-        left_col.sort(key=lambda x: x["y1"])
-        right_col.sort(key=lambda x: x["y1"])
+        # 4. Формируем колонки внутри каждой полосы и распаковываем
+        final_sorted = []
+        for band in bands:
+            if len(band) <= 1:
+                for lb in band:
+                    for phys_box in lb["boxes"]:
+                        final_sorted.append(phys_box["box"])
+                continue
+                
+            columns = []
+            for lb in band:
+                placed = False
+                for col in columns:
+                    if any(get_x_overlap_ratio(lb, cb) > 0.1 for cb in col):
+                        col.append(lb)
+                        placed = True
+                        break
+                
+                if not placed:
+                    columns.append([lb])
 
-        return [item["box"] for item in (full_width + left_col + right_col)]
+            # Сортируем колонки слева направо
+            columns.sort(key=lambda col: min(cb["x1"] for cb in col))
+            
+            # Читаем элементы сверху вниз внутри колонки
+            for col in columns:
+                col.sort(key=lambda x: x["y1"])
+                for lb in col:
+                    # Внутри логического блока физические боксы уже отсортированы сверху вниз
+                    for phys_box in lb["boxes"]:
+                        final_sorted.append(phys_box["box"])
+
+        return final_sorted
 
     def _crop_image(
         self, img: Image.Image, coords: list, padding: int = 0
@@ -133,7 +261,7 @@ class LayoutRouter:
                     os.path.join(vis_dir, f"page_{page_num + 1}.jpg"), annotated_frame
                 )
 
-            sorted_boxes = self._sort_reading_order(results.boxes, pil_img.width)
+            sorted_boxes = self._sort_reading_order(results.boxes, pil_img.width, pil_img.height)
             page_plan = {"page_num": page_num + 1, "blocks": []}
 
             for box in sorted_boxes:
@@ -248,6 +376,41 @@ class LayoutRouter:
                     page_plan["blocks"].append(block)
 
             routing_plan["pages"].append(page_plan)
+        
+            if visualize and vis_dir:
+                # Рисуем поверх оригинальной картинки
+                img_draw = img_cv2.copy()
+                
+                # Отдельный счетчик для валидных (не игнорируемых) блоков
+                valid_block_counter = 1 
+                
+                for box in sorted_boxes:
+                    label = self.model.names[int(box.cls[0])].lower()
+                    
+                    # Пропускаем abandon и все остальные классы из ignore_classes
+                    if label in self.ignore_classes:
+                        continue
+
+                    coords = [int(c) for c in box.xyxy[0].tolist()]
+                    
+                    # Отрисовываем рамку (зеленая)
+                    cv2.rectangle(img_draw, (coords[0], coords[1]), (coords[2], coords[3]), (0, 255, 0), 2)
+                    
+                    # Рисуем порядковый номер и класс блока (например: "1 (text)")
+                    order_text = f"{valid_block_counter} ({label})"
+                    cv2.putText(
+                        img_draw, 
+                        order_text, 
+                        (coords[0] + 5, coords[1] + 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 
+                        0.8, # Немного уменьшили шрифт, чтобы влезло название класса
+                        (0, 0, 255), # Красный цвет (BGR)
+                        2 # Толщина линии
+                    )
+                    
+                    valid_block_counter += 1
+                
+                cv2.imwrite(os.path.join(vis_dir, f"page_{page_num + 1}_order.jpg"), img_draw)
 
         doc.close()
         return routing_plan
