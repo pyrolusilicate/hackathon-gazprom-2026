@@ -1,7 +1,10 @@
 .venv/
+.claude/
 
 data/raw/*
+data/output/*
 
+.cache
 __pycache__/
 *.pyc
 .DS_Store

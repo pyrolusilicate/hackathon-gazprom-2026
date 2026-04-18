@@ -5,16 +5,19 @@ import os
 import cv2
 import fitz
 import numpy as np
-import torch
 from doclayout_yolo import YOLOv10
 from huggingface_hub import hf_hub_download
 from PIL import Image
+
+from device import get_torch_device, setup_environment
+
+setup_environment()
 
 
 class LayoutRouter:
     def __init__(self, weights_dir: str = "weights"):
         self.weights_dir = weights_dir
-        self.device = self._get_device()
+        self.device = get_torch_device()
         self.model = self._load_model()
         self.ignore_classes = {
             "page-header",
@@ -24,13 +27,20 @@ class LayoutRouter:
             "abandon",
         }
         self.vlm_candidates = {"picture", "figure", "image"}
-
-    def _get_device(self) -> str:
-        if torch.cuda.is_available():
-            return "cuda:0"
-        if torch.backends.mps.is_available():
-            return "mps"
-        return "cpu"
+        # Приоритет при NMS: при перекрытии оставляем класс с бо́льшим приоритетом
+        self._class_priority = {
+            "title": 10,
+            "section-header": 9,
+            "table": 8,
+            "figure": 7,
+            "picture": 7,
+            "table_caption": 6,
+            "figure_caption": 6,
+            "caption": 6,
+            "list-item": 5,
+            "text": 4,
+            "plain text": 4,
+        }
 
     def _load_model(self) -> YOLOv10:
         os.makedirs(self.weights_dir, exist_ok=True)
@@ -53,161 +63,206 @@ class LayoutRouter:
             return base_name.replace(".pdf", "")
 
     def _sort_reading_order(self, boxes: list, page_width: float, page_height: float) -> list:
+        """
+        Порядок чтения с устойчивой детекцией колонок.
+
+        Алгоритм:
+          1. Парсим боксы и отбрасываем шапки/подвалы.
+          2. Склеиваем пары (figure/table) + их caption в единый логический блок.
+          3. Определяем, является ли страница многоколоночной, кластеризуя
+             x-центры «узких» блоков (ширина < 55% страницы).
+          4. «Широкие» блоки (заголовки, full-width images) становятся
+             разделителями секций — между ними поток читается колоночно.
+          5. Внутри секции блоки назначаются в ближайшую колонку по x-центру,
+             каждая колонка читается сверху вниз.
+        """
         if not boxes:
             return []
 
-        parsed_boxes = []
+        parsed = []
         for box in boxes:
-            coords = box.xyxy[0].tolist()
-            cls_name = self.model.names[int(box.cls[0])].lower()
-            parsed_boxes.append(
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            parsed.append(
                 {
                     "box": box,
-                    "x1": coords[0],
-                    "y1": coords[1],
-                    "x2": coords[2],
-                    "y2": coords[3],
-                    "w": coords[2] - coords[0],
-                    "h": coords[3] - coords[1],
-                    "cls": cls_name
+                    "x1": x1,
+                    "y1": y1,
+                    "x2": x2,
+                    "y2": y2,
+                    "w": x2 - x1,
+                    "h": y2 - y1,
+                    "cx": (x1 + x2) / 2,
+                    "cls": self.model.names[int(box.cls[0])].lower(),
                 }
             )
 
-        # 1. Фильтрация колонтитулов
-        filtered_boxes = []
+        # 1. Отфильтровать шапки/подвалы (ближе 5% к краю + типовая метка)
         margin_top = page_height * 0.05
         margin_bottom = page_height * 0.95
-        
-        for b in parsed_boxes:
-            if b["cls"] in ["text", "title", "page-header", "page-footer"]:
+        filtered = []
+        for b in parsed:
+            if b["cls"] in ("page-header", "page-footer"):
+                continue
+            if b["cls"] in ("text", "plain text", "title"):
                 if b["y2"] < margin_top or b["y1"] > margin_bottom:
                     continue
-            filtered_boxes.append(b)
+            filtered.append(b)
 
-        # Первичная сортировка сверху вниз
-        filtered_boxes.sort(key=lambda x: x["y1"])
+        if not filtered:
+            return []
 
-        # 2. ЛОГИЧЕСКАЯ ПРЕ-СКЛЕЙКА (Figure + Caption)
-        # Связываем медиа-объекты с их подписями в единые неразрывные блоки
-        logical_blocks = []
-        used_indices = set()
+        filtered.sort(key=lambda x: x["y1"])
 
-        for i, b in enumerate(filtered_boxes):
-            if i in used_indices:
+        # 2. Склейка media + caption в логические блоки.
+        caption_classes = {"figure_caption", "table_caption", "caption"}
+        media_classes = {"figure", "picture", "image", "table"}
+        logical = []
+        used = set()
+        for i, b in enumerate(filtered):
+            if i in used:
                 continue
-                
-            current_logical = [b]
-            used_indices.add(i)
-            
-            base_box = b
-            for j in range(i + 1, len(filtered_boxes)):
-                if j in used_indices:
-                    continue
-                next_box = filtered_boxes[j]
-                
-                # Расстояние по вертикали (если пересекаются, gap отрицательный)
-                y_gap = next_box["y1"] - base_box["y2"]
-                
-                # Доля пересечения по X
-                overlap_x = max(0, min(base_box["x2"], next_box["x2"]) - max(base_box["x1"], next_box["x1"]))
-                min_w = min(base_box["w"], next_box["w"])
-                x_ratio = overlap_x / min_w if min_w > 0 else 0
-                
-                is_caption = next_box["cls"] in ["figure_caption", "table_caption", "caption"]
-                is_parent_media = base_box["cls"] in ["figure", "picture", "image", "table", "table_merged", "table_borderless"]
-                
-                # Если блок находится близко под текущим (< 8% высоты страницы) и сильно выровнен по ширине
-                if y_gap < page_height * 0.08 and x_ratio > 0.5:
-                    # Склеиваем, если это картинка/таблица и текст под ней, либо если это явно подпись
-                    if is_caption or is_parent_media:
-                        current_logical.append(next_box)
-                        used_indices.add(j)
-                        base_box = next_box # Сдвигаем низ для цепочки
-                    else:
-                        break # Два обычных абзаца текста не склеиваем жестко
-                elif y_gap >= page_height * 0.08:
-                    pass # Ушли слишком далеко вниз
-                    
-            # Формируем габариты объединенного логического блока
-            logical_blocks.append({
-                "boxes": current_logical,
-                "x1": min(cb["x1"] for cb in current_logical),
-                "y1": min(cb["y1"] for cb in current_logical),
-                "x2": max(cb["x2"] for cb in current_logical),
-                "y2": max(cb["y2"] for cb in current_logical),
-                "w": max(cb["x2"] for cb in current_logical) - min(cb["x1"] for cb in current_logical),
-                "h": max(cb["y2"] for cb in current_logical) - min(cb["y1"] for cb in current_logical),
-            })
-
-        # Вспомогательные функции для работы с объединенными блоками
-        def get_y_overlap_ratio(b1, b2):
-            overlap = max(0, min(b1["y2"], b2["y2"]) - max(b1["y1"], b2["y1"]))
-            min_h = min(b1["h"], b2["h"])
-            return overlap / min_h if min_h > 0 else 0
-
-        def get_x_overlap_ratio(b1, b2):
-            overlap = max(0, min(b1["x2"], b2["x2"]) - max(b1["x1"], b2["x1"]))
-            min_w = min(b1["w"], b2["w"])
-            return overlap / min_w if min_w > 0 else 0
-
-        # 3. Группируем логические блоки в горизонтальные полосы (Bands)
-        bands = []
-        current_band = []
-
-        for lb in logical_blocks:
-            is_full_width = lb["w"] > page_width * 0.55
-            
-            if is_full_width:
-                if current_band:
-                    bands.append(current_band)
-                    current_band = []
-                bands.append([lb])
-            else:
-                if not current_band:
-                    current_band.append(lb)
-                else:
-                    if any(get_y_overlap_ratio(lb, cb) > 0.1 for cb in current_band):
-                        current_band.append(lb)
-                    else:
-                        bands.append(current_band)
-                        current_band = [lb]
-                        
-        if current_band:
-            bands.append(current_band)
-
-        # 4. Формируем колонки внутри каждой полосы и распаковываем
-        final_sorted = []
-        for band in bands:
-            if len(band) <= 1:
-                for lb in band:
-                    for phys_box in lb["boxes"]:
-                        final_sorted.append(phys_box["box"])
-                continue
-                
-            columns = []
-            for lb in band:
-                placed = False
-                for col in columns:
-                    if any(get_x_overlap_ratio(lb, cb) > 0.1 for cb in col):
-                        col.append(lb)
-                        placed = True
+            group = [b]
+            used.add(i)
+            base = b
+            if base["cls"] in media_classes:
+                for j in range(i + 1, len(filtered)):
+                    if j in used:
+                        continue
+                    nxt = filtered[j]
+                    y_gap = nxt["y1"] - base["y2"]
+                    if y_gap > page_height * 0.05:
                         break
-                
-                if not placed:
-                    columns.append([lb])
+                    overlap_x = max(0, min(base["x2"], nxt["x2"]) - max(base["x1"], nxt["x1"]))
+                    min_w = min(base["w"], nxt["w"]) or 1
+                    if nxt["cls"] in caption_classes and overlap_x / min_w > 0.4:
+                        group.append(nxt)
+                        used.add(j)
+                        base = nxt
+                        break  # подпись одна — дальше не смотрим
+            logical.append(
+                {
+                    "boxes": group,
+                    "x1": min(b["x1"] for b in group),
+                    "y1": min(b["y1"] for b in group),
+                    "x2": max(b["x2"] for b in group),
+                    "y2": max(b["y2"] for b in group),
+                    "cx": sum((b["x1"] + b["x2"]) / 2 for b in group) / len(group),
+                }
+            )
+            logical[-1]["w"] = logical[-1]["x2"] - logical[-1]["x1"]
+            logical[-1]["h"] = logical[-1]["y2"] - logical[-1]["y1"]
 
-            # Сортируем колонки слева направо
-            columns.sort(key=lambda col: min(cb["x1"] for cb in col))
-            
-            # Читаем элементы сверху вниз внутри колонки
-            for col in columns:
-                col.sort(key=lambda x: x["y1"])
-                for lb in col:
-                    # Внутри логического блока физические боксы уже отсортированы сверху вниз
-                    for phys_box in lb["boxes"]:
-                        final_sorted.append(phys_box["box"])
+        # 3. Кластеризация центров «узких» блоков → количество колонок.
+        narrow_centers = sorted(lb["cx"] for lb in logical if lb["w"] < page_width * 0.55)
+        col_centers = self._cluster_centers(narrow_centers, gap=page_width * 0.08)
 
-        return final_sorted
+        # Фильтруем слабые кластеры: минимум 2 блока, центры разнесены ≥ 15%
+        col_centers = [c for c in col_centers if c["count"] >= 2]
+        col_centers.sort(key=lambda c: c["center"])
+        if len(col_centers) >= 2:
+            dx = col_centers[-1]["center"] - col_centers[0]["center"]
+            if dx < page_width * 0.15:
+                col_centers = col_centers[:1]
+
+        is_multi_col = len(col_centers) >= 2
+        centers_x = [c["center"] for c in col_centers] if is_multi_col else None
+
+        # 4. Секции разделены «широкими» блоками (≥ 55% ширины).
+        sections: list[list[dict]] = []
+        current: list[dict] = []
+        for lb in logical:
+            if lb["w"] >= page_width * 0.55:
+                if current:
+                    sections.append(current)
+                    current = []
+                sections.append([lb])
+            else:
+                current.append(lb)
+        if current:
+            sections.append(current)
+
+        # 5. Сортировка внутри секций.
+        final: list = []
+        for sec in sections:
+            if len(sec) == 1 and sec[0]["w"] >= page_width * 0.55:
+                for phys in sec[0]["boxes"]:
+                    final.append(phys["box"])
+                continue
+
+            if is_multi_col:
+                cols: list[list[dict]] = [[] for _ in centers_x]
+                for lb in sec:
+                    dists = [abs(lb["cx"] - cx) for cx in centers_x]
+                    cols[dists.index(min(dists))].append(lb)
+                for col in cols:
+                    col.sort(key=lambda x: x["y1"])
+                    for lb in col:
+                        for phys in lb["boxes"]:
+                            final.append(phys["box"])
+            else:
+                sec.sort(key=lambda x: x["y1"])
+                for lb in sec:
+                    for phys in lb["boxes"]:
+                        final.append(phys["box"])
+
+        return final
+
+    @staticmethod
+    def _cluster_centers(centers: list[float], gap: float) -> list[dict]:
+        """
+        Жадная 1D-кластеризация: соседние точки, расстояние между которыми
+        меньше `gap`, идут в один кластер. Возвращает [{center, count}, ...].
+        """
+        if not centers:
+            return []
+        clusters: list[list[float]] = [[centers[0]]]
+        for c in centers[1:]:
+            if c - clusters[-1][-1] <= gap:
+                clusters[-1].append(c)
+            else:
+                clusters.append([c])
+        return [{"center": sum(cl) / len(cl), "count": len(cl)} for cl in clusters]
+
+    def _apply_nms(self, boxes: list, iom_threshold: float = 0.7) -> list:
+        """
+        Intersection-over-Min-Area NMS: удаляет боксы, у которых
+        >iom_threshold площади перекрывается с уже принятым боксом.
+        Приоритет: класс-приоритет, затем confidence.
+        """
+        if not boxes:
+            return boxes
+
+        def priority(box):
+            cls = self.model.names[int(box.cls[0])].lower()
+            return self._class_priority.get(cls, 3), float(box.conf[0])
+
+        sorted_boxes = sorted(boxes, key=priority, reverse=True)
+        kept: list = []
+
+        for box in sorted_boxes:
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+            if area == 0:
+                continue
+
+            dominated = False
+            for kb in kept:
+                kx1, ky1, kx2, ky2 = kb.xyxy[0].tolist()
+                ix1, iy1 = max(x1, kx1), max(y1, ky1)
+                ix2, iy2 = min(x2, kx2), min(y2, ky2)
+                if ix2 <= ix1 or iy2 <= iy1:
+                    continue
+                inter = (ix2 - ix1) * (iy2 - iy1)
+                k_area = max(0.0, kx2 - kx1) * max(0.0, ky2 - ky1)
+                min_area = min(area, k_area)
+                if min_area > 0 and inter / min_area > iom_threshold:
+                    dominated = True
+                    break
+
+            if not dominated:
+                kept.append(box)
+
+        return kept
 
     def _crop_image(
         self, img: Image.Image, coords: list, padding: int = 0
@@ -232,7 +287,7 @@ class LayoutRouter:
             os.makedirs(vis_dir, exist_ok=True)
 
         doc = fitz.open(pdf_path)
-        routing_plan = {"doc_id": doc_id, "pages": []}
+        routing_plan = {"doc_id": doc_id, "pdf_path": os.path.abspath(pdf_path), "pages": []}
         global_image_counter = 1
 
         print(f"\nАнализ: {os.path.basename(pdf_path)} (ID: {doc_id})")
@@ -261,8 +316,16 @@ class LayoutRouter:
                     os.path.join(vis_dir, f"page_{page_num + 1}.jpg"), annotated_frame
                 )
 
-            sorted_boxes = self._sort_reading_order(results.boxes, pil_img.width, pil_img.height)
-            page_plan = {"page_num": page_num + 1, "blocks": []}
+            filtered_boxes = self._apply_nms(list(results.boxes))
+            sorted_boxes = self._sort_reading_order(filtered_boxes, pil_img.width, pil_img.height)
+            page_plan = {
+                "page_num": page_num + 1,
+                "width_px": pil_img.width,
+                "height_px": pil_img.height,
+                "width_pt": page.rect.width,
+                "height_pt": page.rect.height,
+                "blocks": [],
+            }
 
             for box in sorted_boxes:
                 coords = [int(c) for c in box.xyxy[0].tolist()]

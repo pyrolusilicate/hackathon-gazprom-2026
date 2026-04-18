@@ -5,13 +5,18 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "accelerate>=1.0.0",
     "doclayout-yolo>=0.0.4",
+    "easyocr>=1.7.0",
     "huggingface-hub>=1.11.0",
     "opencv-python>=4.13.0.92",
     "pandas>=3.0.2",
+    "pdfplumber>=0.11.0",
     "pillow>=12.2.0",
     "pymupdf>=1.27.2.2",
+    "qwen-vl-utils>=0.0.11",
     "torch>=2.11.0",
     "torchvision>=0.26.0",
+    "transformers>=4.49.0",
     "ultralytics>=8.4.38",
 ]
