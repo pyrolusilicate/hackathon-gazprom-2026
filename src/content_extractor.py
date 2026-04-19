@@ -3,9 +3,9 @@
 
 Треки:
 - VECTOR_TEXT  — PyMuPDF text dict по bbox
-- VECTOR_TABLE — PyMuPDF page.find_tables() c сопоставлением по IoU bbox
-- RASTER_*     — VLM (DeepSeek-OCR-2), вызывается из pipeline.py
-- SMART_FIGURE — VLM-классификация + маршрутизация
+- RASTER_TABLE — DeepSeek-OCR-2 (все таблицы через VLM)
+- RASTER_TEXT  — DeepSeek-OCR-2 (растровый текст / сканы)
+- SMART_FIGURE — VLM-классификация → markdown/ocr/PNG
 """
 
 from __future__ import annotations
@@ -355,11 +355,21 @@ def estimate_text_density(img: Image.Image) -> float:
     return float(binary.sum()) / (255.0 * binary.size)
 
 
+# Строки-фрагменты водяных знаков/штампов: только заглавные буквы, 2–6 символов.
+# "DRAFT", "КОН", "ЕНЦ", "ИДЕ" и т.п. — артефакты OCR при разрыве страницы.
+_STAMP_FRAG_RE = re.compile(r"^[А-ЯЁA-Z]{2,6}$")
+
+
 def filter_noise_lines(text: str, min_chars: int = 3) -> str:
-    """Убирает коротко-мусорные строки (остатки буквиц/рамок)."""
+    """Убирает коротко-мусорные строки и фрагменты водяных знаков/штампов."""
     if not text:
         return ""
-    lines = [
-        l for l in text.splitlines() if len(l.strip().replace(" ", "")) >= min_chars
-    ]
+    lines = []
+    for l in text.splitlines():
+        stripped = l.strip()
+        if len(stripped.replace(" ", "")) < min_chars:
+            continue
+        if _STAMP_FRAG_RE.match(stripped):
+            continue
+        lines.append(l)
     return "\n".join(lines).strip()

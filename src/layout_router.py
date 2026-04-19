@@ -41,8 +41,7 @@ class LayoutRouter:
             "title": 10,
             "section-header": 9,
             "table": 8,
-            "table_merged": 8,       # <- ДОБАВИТЬ
-            "table_borderless": 8,   # <- ДОБАВИТЬ
+            
             "figure": 7,
             "picture": 7,
             "table_caption": 6,
@@ -435,17 +434,9 @@ class LayoutRouter:
             pil_img = Image.fromarray(img_rgb)
 
             # --- ВНЕДРЕНИЕ ОЧИСТКИ ОТ ШУМА ---
-            gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
-            
-            # Детектируем, есть ли жесткий шум (используем твой же метод)
-            is_noisy = self._is_image_noisy(gray, noise_threshold=5000) 
-            if is_noisy:
-                # Медианный фильтр (kernel=3) — идеальное оружие против "соли и перца".
-                # Он стирает точки, но НЕ выжигает синие фоны таблиц.
-                img_cv2_ready = cv2.medianBlur(img_cv2, 3)
-            else:
-                img_cv2_ready = img_cv2.copy()
+            img_cv2_denoised = cv2.medianBlur(img_cv2, 3)
 
+            # =====================================================================
             # --- ВНЕДРЕНИЕ: MULTI-SCALE INFERENCE (ДВУХПРОХОДНЫЙ АНСАМБЛЬ) ---
             # =====================================================================
 
@@ -627,32 +618,26 @@ class LayoutRouter:
 
                 # Кропы только для OCR и таблиц
                 if block["track"] in ["PADDLE_OCR", "DOCLING_TABLE"]:
-                    if is_duplicate(coords): # удаление дубликатов
-                        continue
-                    saved_crops_coords.append(coords)
-
-                    prefix = "table" if block["track"] == "DOCLING_TABLE" else "candidate"
-                    
-                    # НОВОЕ НАЗВАНИЕ ФАЙЛОВ С УКАЗАНИЕМ X и Y (для уникальности на диске)
-                    fname = f"{prefix}_p{page_num + 1}_y{coords[1]}_x{coords[0]}.png"
+                    prefix = (
+                        "table" if block["track"] == "DOCLING_TABLE" else "candidate"
+                    )
+                    fname = (
+                        f"{prefix}_{global_image_counter}.png"
+                        if prefix == "candidate"
+                        else f"table_p{page_num + 1}_{coords[1]}.png"
+                    )
                     temp_path = os.path.join(temp_dir, fname)
 
-                    crop_img = self._crop_image(
-                        pil_img, coords, padding=25 if label == "table" else 0
-                    )
-                    
-                    # Если нужно очистить фон для OCR — делай это здесь, адаптивно:
-                    if block["track"] == "PADDLE_OCR":
-                        crop_cv = cv2.cvtColor(np.array(crop_img), cv2.COLOR_RGB2BGR)
-                        crop_gray = cv2.cvtColor(crop_cv, cv2.COLOR_BGR2GRAY)
-                        # Адаптивный порог работает локально и не убивает цветные плашки
-                        crop_clean = cv2.adaptiveThreshold(
-                            crop_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                            cv2.THRESH_BINARY, 11, 2
-                        )
-                        crop_img = Image.fromarray(crop_clean)
+                    self._crop_image(
+                        pil_img, coords, padding=10 if label == "table" else 0
+                    ).save(temp_path)
 
-                    crop_img.save(temp_path)
+                    block["content_path"] = temp_path
+                    if block["track"] == "PADDLE_OCR":
+                        block["md_image_name"] = (
+                            f"doc_{doc_id}_image_{global_image_counter}.png"
+                        )
+                        global_image_counter += 1
 
                 page_plan["blocks"].append(block)
 

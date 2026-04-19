@@ -51,7 +51,7 @@ from layout_router import LayoutRouter
 setup_environment()
 
 OUTPUT_DIR = "data/output"
-IMAGE_MAX_SIDE = 2400
+IMAGE_MAX_SIDE = 150
 VLM_RENDER_DPI = 300
 
 FIGURE_LABELS = {"picture", "figure", "image", "missed_raster"}
@@ -96,15 +96,22 @@ class Pipeline:
         pdf_doc = fitz.open(pdf_path)
 
         self._enrich_plan_with_tracks(plan, pdf_doc)
-
         heading_sizes = collect_heading_sizes(pdf_doc, plan)
 
-        chunks: list[str] = []
+        # Собираем плоский список (track, md, is_last_on_page) для всех блоков.
+        # is_last определяется по позиции среди непустых выводов страницы,
+        # а не по позиции блока в исходном плане — блоки могут вернуть пустой md.
+        flat: list[tuple[str, str, bool]] = []
         for page_data in plan["pages"]:
-            chunks.append(
-                self._process_page(page_data, pdf_doc, heading_sizes)
-            )
-            # Очищаем VRAM между страницами (особенно важно на Colab/40GB).
+            page_num = page_data["page_num"] - 1
+            page_items: list[tuple[str, str]] = []
+            for block in page_data["blocks"]:
+                md = self._process_block(block, page_num, pdf_doc, heading_sizes)
+                if md and md.strip():
+                    page_items.append((block["track"], md.strip()))
+            n = len(page_items)
+            for i, (track, md) in enumerate(page_items):
+                flat.append((track, md, i == n - 1))
             if self.vlm is not None:
                 self.vlm.release_page_cache()
             else:
@@ -112,7 +119,8 @@ class Pipeline:
 
         pdf_doc.close()
 
-        markdown = "\n\n".join(c for c in chunks if c.strip())
+        parts = _merge_cross_page_tables(flat)
+        markdown = "\n\n".join(parts)
         md_path = os.path.join(self.output_dir, f"{doc_name}.md")
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(markdown)
@@ -248,9 +256,10 @@ class Pipeline:
         if self.vlm is None:
             return ""
         img = render_block_image(pdf_doc, page_num, coords, dpi=VLM_RENDER_DPI)
-        # extract_markdown лучше справляется с русским и смешанными блоками,
-        # чем free_ocr (который оптимизирован под короткие блоки на латинице).
         text = self.vlm.extract_markdown(img).strip()
+        if not text:
+            # Fallback для коротких блоков (4-6 слов), где extract_markdown даёт пустоту
+            text = self.vlm.free_ocr(img).strip()
         text = filter_noise_lines(text, min_chars=3)
         if not text:
             return ""
@@ -291,42 +300,44 @@ class Pipeline:
         if pil_img is None:
             pil_img = render_block_image(pdf_doc, page_num, coords, dpi=VLM_RENDER_DPI)
 
-        # Всегда сохраняем изображение — метрика проверяет наличие файла.
-        alt = "image"
-        if self.vlm is not None:
-            try:
-                alt = self.vlm.short_caption(pil_img) or "image"
-            except Exception:
-                pass
-        image_md = self._save_figure(pil_img, md_image_name, alt=alt)
-
         if self.vlm is None:
-            return image_md
+            return self._save_figure(pil_img, md_image_name, alt="image")
 
-        kind = "picture"
+        raw = ""
         try:
-            kind = self.vlm.classify(pil_img)
+            raw = self.vlm.extract_markdown(pil_img).strip()
+            if not raw:
+                # Fallback для маленьких блоков с 4-6 словами
+                raw = self.vlm.free_ocr(pil_img).strip()
         except Exception:
             pass
 
-        if kind == "table":
-            md = self.vlm.extract_markdown(pil_img).strip()
-            md = _postprocess_table_markdown(md)
+        # Определяем таблицу по содержимому вывода — без отдельного classify.
+        is_table = _looks_like_table(raw)
+
+        if is_table:
+            # Таблицы НЕ сохраняем как PNG: они тяжёлые и метрика их не требует.
+            md = _postprocess_table_markdown(raw)
             if md:
-                return md  # таблица — только markdown, без image-ссылки
+                return md
+            # Постпроцесс не справился — сохраняем как fallback
+            return self._save_figure(pil_img, md_image_name, alt="таблица")
 
-        # Для текста и рукописного — OCR через extract_markdown (лучше для русского).
-        if kind in ("text", "handwritten"):
-            text = ""
+        # Для обычных изображений: ссылка + OCR-текст построчно.
+        text = filter_noise_lines(raw, min_chars=3)
+        # Убираем из текста строки-мусор вида ![...](...)  которые OCR подхватил из PDF.
+        text = _strip_md_image_lines(text)
+
+        # alt: первая чистая строка OCR, иначе русская подпись
+        alt = _first_clean_line(text)
+        if not alt:
             try:
-                text = self.vlm.extract_markdown(pil_img).strip()
-                text = filter_noise_lines(text, min_chars=3)
+                alt = self.vlm.short_caption(pil_img) or "image"
             except Exception:
-                pass
-            if text:
-                return f"{image_md}\n\n{text}"
+                alt = "image"
 
-        return image_md
+        image_md = self._save_figure(pil_img, md_image_name, alt=alt)
+        return f"{image_md}\n{text}" if text else image_md
 
     def _save_figure(
         self,
@@ -338,16 +349,16 @@ class Pipeline:
             return ""
         dest = os.path.join(self.images_dir, md_image_name)
         try:
-            img = pil_img
-            if max(img.width, img.height) > IMAGE_MAX_SIDE:
-                img = img.copy()
-                img.thumbnail((IMAGE_MAX_SIDE, IMAGE_MAX_SIDE), Image.LANCZOS)
-            img.save(dest, "PNG", optimize=True)
+            img = pil_img.convert("RGB")
+            img.thumbnail((IMAGE_MAX_SIDE, IMAGE_MAX_SIDE), Image.NEAREST)
+            img.save(dest, "PNG", optimize=True, compress_level=9)
         except Exception:
             pass
 
         alt = (alt or "image").strip() or "image"
-        alt = alt.replace("[", "").replace("]", "").replace("(", "").replace(")", "")
+        for ch in "![]()":
+            alt = alt.replace(ch, "")
+        alt = alt.strip() or "image"
         return f"![{alt}](images/{md_image_name})"
 
     # ------------------------------------------------------------------
@@ -369,8 +380,108 @@ class Pipeline:
             if img_dir.exists():
                 for img_file in sorted(img_dir.glob("*.png")):
                     zf.write(img_file, f"images/{img_file.name}")
-        print(f"ZIP: {zip_path} ({Path(zip_path).stat().st_size // 1024} KB)")
         return zip_path
+
+
+# ---------------------------------------------------------------------------
+# Склейка таблиц, разрезанных переносом страницы
+# ---------------------------------------------------------------------------
+
+
+def _merge_two_tables(t1: str, t2: str) -> str:
+    """
+    Склеивает две части таблицы:
+    - pipe + pipe → добавляет строки t2, отбрасывая повторный заголовок
+    - plain_text + pipe → plain text становится заголовком (VLM вернул
+      заголовочную строку без pipe-форматирования, данные — нормальной таблицей)
+    """
+    lines1 = [l for l in t1.splitlines() if l.strip()]
+    lines2 = [l for l in t2.splitlines() if l.strip()]
+    if not lines1 or not lines2:
+        return (t1 + "\n\n" + t2).strip()
+
+    t1_has_pipe = any(l.strip().startswith("|") for l in lines1)
+    t2_has_pipe = any(l.strip().startswith("|") for l in lines2)
+
+    if not t1_has_pipe and t2_has_pipe:
+        # t1 = plain-text слова (по одному на строку) — заголовки столбцов
+        # t2 = pipe-таблица с данными
+        pipe_lines2 = [l for l in lines2 if l.strip().startswith("|")]
+        n_cols = len([c for c in pipe_lines2[0].strip().strip("|").split("|")])
+        if abs(len(lines1) - n_cols) <= 1:
+            headers = lines1[:n_cols] + [""] * max(0, n_cols - len(lines1))
+            header_row = "| " + " | ".join(headers) + " |"
+            sep_row = "| " + " | ".join(["---"] * n_cols) + " |"
+            # Все не-разделители из t2 — данные (включая "ложную" первую строку t2)
+            data_rows = [l for l in lines2
+                         if l.strip().startswith("|")
+                         and not re.match(r"^\|\s*[-:]+", l.strip())]
+            return "\n".join([header_row, sep_row] + data_rows)
+
+    # Оба pipe: добавляем данные t2 к t1, пропуская повторный заголовок
+    header1 = lines1[0].strip()
+    data2 = []
+    for i, ln in enumerate(lines2):
+        if i == 0 and ln.strip() == header1:
+            continue
+        if re.match(r"^\|\s*[-:]+", ln.strip()):
+            continue
+        data2.append(ln)
+    return "\n".join(lines1 + data2)
+
+
+def _text_looks_like_table_headers(md: str, n_cols: int) -> bool:
+    """True если md — список коротких строк без pipe, похожий на заголовки столбцов."""
+    if "|" in md:
+        return False
+    lines = [l.strip() for l in md.splitlines() if l.strip()]
+    if not lines or abs(len(lines) - n_cols) > 1:
+        return False
+    # Каждая строка короткая (не абзац)
+    return all(len(l) <= 60 for l in lines)
+
+
+def _merge_cross_page_tables(flat: list[tuple[str, str, bool]]) -> list[str]:
+    """
+    Склеивает части таблицы, разрезанной переносом страницы.
+    Два подряд RASTER_TABLE → мержим.
+    TEXT-блок + RASTER_TABLE с совпадающим числом столбцов → text становится заголовком.
+    flat — список (track, md, is_last_on_page).
+    """
+    result: list[str] = []
+    i = 0
+    while i < len(flat):
+        track, md, _ = flat[i]
+
+        # Текстовый блок перед таблицей — может быть заголовком
+        if (
+            track in ("VECTOR_TEXT", "RASTER_TEXT")
+            and i + 1 < len(flat)
+            and flat[i + 1][0] == "RASTER_TABLE"
+        ):
+            _, next_md, next_last = flat[i + 1]
+            pipe_lines = [l for l in next_md.splitlines() if l.strip().startswith("|")]
+            if pipe_lines:
+                n_cols = len([c for c in pipe_lines[0].strip().strip("|").split("|")])
+                if _text_looks_like_table_headers(md, n_cols):
+                    merged = _merge_two_tables(md, next_md)
+                    flat[i + 1] = ("RASTER_TABLE", merged, next_last)
+                    i += 1
+                    continue
+
+        # Два подряд RASTER_TABLE → мержим (продолжение таблицы через страницу)
+        while (
+            track == "RASTER_TABLE"
+            and i + 1 < len(flat)
+            and flat[i + 1][0] == "RASTER_TABLE"
+        ):
+            i += 1
+            _, next_md, _ = flat[i]
+            md = _merge_two_tables(md, next_md)
+
+        result.append(md)
+        i += 1
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +545,52 @@ def _postprocess_table_markdown(md: str) -> str:
             return format_table_markdown(rows) or md.strip()
 
     return md.strip()
+
+
+# ---------------------------------------------------------------------------
+# Вспомогательные функции для _smart_figure
+# ---------------------------------------------------------------------------
+
+_MD_IMAGE_LINE_RE = re.compile(r"^!?\[.*?\]\(.*?\)\s*$")
+
+
+def _looks_like_table(raw: str) -> bool:
+    """True если вывод VLM содержит таблицу (HTML или pipe-markdown)."""
+    if not raw:
+        return False
+    if "<table" in raw.lower():
+        return True
+    lines = raw.splitlines()
+    pipe_lines = [l for l in lines if l.strip().startswith("|")]
+    sep_lines = [l for l in pipe_lines if re.match(r"^\|\s*:?-{2,}", l.strip())]
+    return len(pipe_lines) >= 3 and len(sep_lines) >= 1
+
+
+def _strip_md_image_lines(text: str) -> str:
+    """Удаляет строки вида ![...](...)  — OCR иногда «читает» встроенные картинки из PDF."""
+    if not text:
+        return ""
+    lines = [l for l in text.splitlines() if not _MD_IMAGE_LINE_RE.match(l.strip())]
+    return "\n".join(lines).strip()
+
+
+def _first_clean_line(text: str) -> str:
+    """Первая строка текста без markdown-символов, пригодная для alt (≤80 символов)."""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if _MD_IMAGE_LINE_RE.match(line):
+            continue
+        if line.startswith(("#", "|", "!", "[")):
+            continue
+        clean = line[:80]
+        for ch in "![]()":
+            clean = clean.replace(ch, "")
+        clean = clean.strip()
+        if clean:
+            return clean
+    return ""
 
 
 # ---------------------------------------------------------------------------

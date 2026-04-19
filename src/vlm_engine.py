@@ -108,7 +108,6 @@ class VLMEngine:
         except ImportError:
             attn_impl = "sdpa"
 
-        print(f"  [VLM] Загрузка {self.model_id} на {self.device} (bfloat16, attn={attn_impl})...")
         self._tokenizer = AutoTokenizer.from_pretrained(
             self.model_id, trust_remote_code=True
         )
@@ -119,7 +118,7 @@ class VLMEngine:
             use_safetensors=True,
         )
         self._model = model.eval().cuda().to(torch.bfloat16)
-        print("  [VLM] Готово.")
+        print(f"  [VLM] {self.model_id} ready ({attn_impl})")
 
     def release_page_cache(self) -> None:
         """Вызывать между страницами: освобождает VRAM без выгрузки весов."""
@@ -165,23 +164,11 @@ class VLMEngine:
 
         def _run_infer(crop: bool) -> str:
             """Запускает model.infer, возвращает сырой текст или ''."""
+            import contextlib
             try:
-                self._model.infer(
-                    self._tokenizer,
-                    prompt=prompt,
-                    image_file=image_file,
-                    output_path=out_dir,
-                    base_size=base_size,
-                    image_size=image_size,
-                    crop_mode=crop,
-                    save_results=True,
-                )
-                mmd_path = os.path.join(out_dir, "result.mmd")
-                if os.path.exists(mmd_path):
-                    with open(mmd_path, "r", encoding="utf-8") as f:
-                        return f.read()
-                # result.mmd не создался — пробуем без save_results
-                return (
+                with open(os.devnull, "w") as devnull, \
+                     contextlib.redirect_stdout(devnull), \
+                     contextlib.redirect_stderr(devnull):
                     self._model.infer(
                         self._tokenizer,
                         prompt=prompt,
@@ -190,28 +177,53 @@ class VLMEngine:
                         base_size=base_size,
                         image_size=image_size,
                         crop_mode=crop,
-                        save_results=False,
+                        save_results=True,
                     )
-                    or ""
-                )
+                mmd_path = os.path.join(out_dir, "result.mmd")
+                if os.path.exists(mmd_path):
+                    with open(mmd_path, "r", encoding="utf-8") as f:
+                        return f.read()
+                # result.mmd не создался — пробуем без save_results
+                with open(os.devnull, "w") as devnull, \
+                     contextlib.redirect_stdout(devnull), \
+                     contextlib.redirect_stderr(devnull):
+                    result = (
+                        self._model.infer(
+                            self._tokenizer,
+                            prompt=prompt,
+                            image_file=image_file,
+                            output_path=out_dir,
+                            base_size=base_size,
+                            image_size=image_size,
+                            crop_mode=crop,
+                            save_results=False,
+                        )
+                        or ""
+                    )
+                return result
             except Exception as exc:  # noqa: BLE001
                 return f"__ERR__{exc}"
 
-        text = _run_infer(crop_mode)
+        try:
+            text = _run_infer(crop_mode)
 
-        # Баг DeepSeek-OCR-2: при crop_mode=True и маленьком изображении
-        # переменная param_img не инициализируется → UnboundLocalError.
-        # Retry с crop_mode=False всегда работает.
-        if text.startswith("__ERR__"):
-            err = text[7:]
-            if crop_mode:
-                text = _run_infer(False)
-                if text.startswith("__ERR__"):
-                    print(f"  [VLM] infer failed: {text[7:]}")
+            if text.startswith("__ERR__"):
+                err = text[7:]
+                # Баг DeepSeek-OCR-2: param_img не инициализируется на маленьких
+                # изображениях. Retry с crop_mode=False, если ещё не пробовали.
+                if crop_mode:
+                    text = _run_infer(False)
+                    if text.startswith("__ERR__"):
+                        err2 = text[7:]
+                        if "param_img" not in err2:
+                            print(f"  [VLM] infer failed: {err2}")
+                        text = ""
+                elif "param_img" in err:
+                    # Известный баг — подавляем, возвращаем пустую строку
                     text = ""
-            else:
-                print(f"  [VLM] infer failed: {err}")
-                text = ""
+                else:
+                    print(f"  [VLM] infer failed: {err}")
+                    text = ""
         finally:
             shutil.rmtree(out_dir, ignore_errors=True)
             if tmp_img_path:
@@ -254,4 +266,3 @@ class VLMEngine:
             if key in raw:
                 return key
         return "picture"
-    
