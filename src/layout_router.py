@@ -338,6 +338,45 @@ class LayoutRouter:
         return img.crop((x1, y1, x2, y2))
     
     @staticmethod
+    def _is_box_empty(coords: list, gray_img: np.ndarray) -> bool:
+        """
+        Анализирует пиксели внутри бокса. Если там только фон или мелкая пыль — возвращает True.
+        """
+        x1, y1, x2, y2 = map(int, coords)
+        
+        # Делаем отступ внутрь на 5 пикселей. Это нужно, чтобы случайно не 
+        # зацепить хвост длинной буквы из соседнего (настоящего) абзаца.
+        margin = 5
+        x1_c, y1_c = min(x1 + margin, x2), min(y1 + margin, y2)
+        x2_c, y2_c = max(x1, x2 - margin), max(y1, y2 - margin)
+        
+        crop = gray_img[y1_c:y2_c, x1_c:x2_c]
+        
+        # Если бокс был настолько узким, что после отступа схлопнулся
+        if crop.size == 0 or crop.shape[0] < 5 or crop.shape[1] < 5:
+            return True
+            
+        # Бинаризуем вырезанный кусок
+        _, thresh = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        
+        # Ищем все независимые объекты внутри бокса
+        num_labels, _, stats, _ = cv2.connectedComponentsWithStats(thresh, connectivity=8)
+        
+        if num_labels <= 1:
+            return True # Внутри только белый фон
+            
+        # Достаем площади всех объектов (исключая фон - индекс 0)
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        max_area = np.max(areas)
+        
+        # Настоящая буква при DPI 1280 занимает ощутимую площадь.
+        # Если самая крупная деталь меньше 35 пикселей — это просто скопление пыли.
+        if max_area < 35:
+            return True
+            
+        return False
+    
+    @staticmethod
     def _is_image_noisy(img_gray: np.ndarray, noise_threshold: int = 3000) -> bool:
         """
         Быстрый детектор точечного шума на основе анализа связных компонент.
@@ -396,42 +435,37 @@ class LayoutRouter:
             # --- ВНЕДРЕНИЕ ОЧИСТКИ ОТ ШУМА ---
             gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
             
-            is_noisy = self._is_image_noisy(gray, noise_threshold=7000)
-            if is_noisy:
-                _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            # УБИРАЕМ деструктивную бинаризацию Оцу перед YOLO.
+            # Оставляем оригинальное изображение, чтобы не ломать цветные плашки таблиц.
+            img_cv2_ready = img_cv2.copy()
+
+            # # Повышаем порог входа, чтобы не трогать слегка пыльные, но читаемые листы
+            # is_noisy = self._is_image_noisy(gray, noise_threshold=8000) 
+            # if is_noisy:
+            #     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
                 
-                # 2. Ищем все независимые пятна (компоненты связности)
-                num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+            #     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+            #     areas = stats[:, cv2.CC_STAT_AREA]
                 
-                # 3. Достаем площади всех найденных пятен
-                areas = stats[:, cv2.CC_STAT_AREA]
+            #     # --- ЛЕЧИМ РАЗРЫВ ТАБЛИЦ ---
+            #     # Снижаем агрессию ластика. Кап в 5 пикселей убьет реальную "снежную" пыль (точки 2x2), 
+            #     # но 100% сохранит пунктирные линии таблиц, границы ячеек и знаки препинания.
+            #     dynamic_threshold = num_labels / 8000.0
+            #     aria = int(np.clip(dynamic_threshold, 2, 5)) 
                 
-                # --- ДИНАМИЧЕСКИЙ РАСЧЕТ ПОРОГА (АДАПТИВНЫЙ ЛАСТИК) ---
-                # Плотность шума прямо пропорциональна количеству мусорных компонент (num_labels).
-                # Делим общее число объектов на эмпирический коэффициент (например, 800).
-                # np.clip гарантирует, что мы не опустимся ниже 3 пикселей (на чистых листах)
-                # и не поднимемся выше 18 пикселей (чтобы не удалить запятые и точки на грязных).
+            #     valid_labels_mask = (areas > aria).astype(np.uint8) * 255
+            #     valid_labels_mask[0] = 0  # Индекс 0 это фон
                 
-                dynamic_threshold = num_labels / 6000.0
-                print(dynamic_threshold)
-                aria = int(np.clip(dynamic_threshold, 3, 18))
-                # --------------------------------------------------------
+            #     clean_mask = valid_labels_mask[labels]
                 
-                # 4. Векторная магия Numpy
-                valid_labels_mask = (areas > aria).astype(np.uint8) * 255
-                valid_labels_mask[0] = 0  # Индекс 0 это фон, его тоже делаем черным в маске
-                
-                # Превращаем лейблы обратно в картинку-маску
-                clean_mask = valid_labels_mask[labels]
-                
-                # 5. Накладываем идеальный белый фон поверх шума
-                # Всё, что является полезным текстом, останется в ИДЕАЛЬНОМ оригинальном качестве
-                img_cv2_ready = img_cv2.copy()
-                img_cv2_ready[clean_mask == 0] = [255, 255, 255]
-            else:
-                # Страница чистая -> не трогаем пиксели, применяем только легкий блюр 
-                # для сглаживания возможных артефактов PDF-рендеринга
-                img_cv2_ready = cv2.medianBlur(img_cv2, 3)
+            #     img_cv2_ready = img_cv2.copy()
+            #     img_cv2_ready[clean_mask == 0] = [255, 255, 255]
+            # else:
+            #     # --- ЛЕЧИМ КРИВОЙ ДЕТЕКТ НА ЧИСТЫХ СТРАНИЦАХ ---
+            #     # Убиваем medianBlur! На чистых страницах он только портил резкость
+            #     # и сбивал YOLO с толку. Отдаем девственно чистую картинку.
+            #     img_cv2_ready = img_cv2.copy()
+            # =====================================================================
             # =====================================================================
             # --- ВНЕДРЕНИЕ: MULTI-SCALE INFERENCE (ДВУХПРОХОДНЫЙ АНСАМБЛЬ) ---
             # =====================================================================
@@ -562,12 +596,42 @@ class LayoutRouter:
                 "blocks": [],
             }
 
+            # Хранилище уже вырезанных боксов на этой странице для удаления дубликатов
+            saved_crops_coords = []
+            
+            def is_duplicate(new_coords):
+                for saved in saved_crops_coords:
+                    x_left = max(new_coords[0], saved[0])
+                    y_top = max(new_coords[1], saved[1])
+                    x_right = min(new_coords[2], saved[2])
+                    y_bottom = min(new_coords[3], saved[3])
+                    
+                    if x_right > x_left and y_bottom > y_top:
+                        inter = (x_right - x_left) * (y_bottom - y_top)
+                        area_new = (new_coords[2] - new_coords[0]) * (new_coords[3] - new_coords[1])
+                        area_saved = (saved[2] - saved[0]) * (saved[3] - saved[1])
+                        
+                        # Если пересечение занимает больше 85% от ЛЮБОГО из боксов - это наглый дубликат
+                        if inter / min(area_new, area_saved) > 0.85:
+                            return True
+                return False
+
             for box in sorted_boxes:
                 coords = [int(c) for c in box.xyxy[0].tolist()]
                 label = self.model.names[int(box.cls[0])].lower()
 
                 if label in self.ignore_classes:
                     continue
+
+                if self._is_box_empty(coords, gray):
+                    continue
+
+                # удаление цельностраничных кандидатов
+                box_area = (coords[2] - coords[0]) * (coords[3] - coords[1])
+                page_area_px = pil_img.width * pil_img.height
+                
+                if (box_area / page_area_px) > 0.75:
+                    continue  # Игнорируем гигантские боксы (фон или весь лист)
 
                 block = {
                     "type": label,
@@ -584,26 +648,32 @@ class LayoutRouter:
 
                 # Кропы только для OCR и таблиц
                 if block["track"] in ["PADDLE_OCR", "DOCLING_TABLE"]:
-                    prefix = (
-                        "table" if block["track"] == "DOCLING_TABLE" else "candidate"
-                    )
-                    fname = (
-                        f"{prefix}_{global_image_counter}.png"
-                        if prefix == "candidate"
-                        else f"table_p{page_num + 1}_{coords[1]}.png"
-                    )
+                    if is_duplicate(coords): # удаление дубликатов
+                        continue
+                    saved_crops_coords.append(coords)
+
+                    prefix = "table" if block["track"] == "DOCLING_TABLE" else "candidate"
+                    
+                    # НОВОЕ НАЗВАНИЕ ФАЙЛОВ С УКАЗАНИЕМ X и Y (для уникальности на диске)
+                    fname = f"{prefix}_p{page_num + 1}_y{coords[1]}_x{coords[0]}.png"
                     temp_path = os.path.join(temp_dir, fname)
 
-                    self._crop_image(
+                    crop_img = self._crop_image(
                         pil_img, coords, padding=25 if label == "table" else 0
-                    ).save(temp_path)
-
-                    block["content_path"] = temp_path
+                    )
+                    
+                    # Если нужно очистить фон для OCR — делай это здесь, адаптивно:
                     if block["track"] == "PADDLE_OCR":
-                        block["md_image_name"] = (
-                            f"doc_{doc_id}_image_{global_image_counter}.png"
+                        crop_cv = cv2.cvtColor(np.array(crop_img), cv2.COLOR_RGB2BGR)
+                        crop_gray = cv2.cvtColor(crop_cv, cv2.COLOR_BGR2GRAY)
+                        # Адаптивный порог работает локально и не убивает цветные плашки
+                        crop_clean = cv2.adaptiveThreshold(
+                            crop_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                            cv2.THRESH_BINARY, 11, 2
                         )
-                        global_image_counter += 1
+                        crop_img = Image.fromarray(crop_clean)
+
+                    crop_img.save(temp_path)
 
                 page_plan["blocks"].append(block)
 
@@ -613,6 +683,11 @@ class LayoutRouter:
                 img_rect = fitz.Rect(img["bbox"])
 
                 if img_rect.width < 50 or img_rect.height < 50:
+                    continue
+                
+                # игнор фоновых изображений
+                page_area_pt = page.rect.width * page.rect.height
+                if img_rect.get_area() / page_area_pt > 0.75:
                     continue
 
                 is_caught_by_yolo = False
@@ -631,6 +706,7 @@ class LayoutRouter:
                         is_caught_by_yolo = True
                         break
 
+                # И заменяем блок добавления пропущенного растра:
                 if not is_caught_by_yolo:
                     missed_coords = [
                         int(img_rect.x0 * (LAYOUT_TO_PDF)),
@@ -646,11 +722,13 @@ class LayoutRouter:
                         min(pil_img.height, missed_coords[3]),
                     ]
 
-                    if (
-                        missed_coords[2] <= missed_coords[0]
-                        or missed_coords[3] <= missed_coords[1]
-                    ):
+                    if (missed_coords[2] <= missed_coords[0] or missed_coords[3] <= missed_coords[1]):
                         continue
+                        
+                    # убираем дубликаты для растра
+                    if is_duplicate(missed_coords):
+                        continue
+                    saved_crops_coords.append(missed_coords)
 
                     block = {
                         "type": "missed_raster",
@@ -660,15 +738,13 @@ class LayoutRouter:
                         "md_image_name": None,
                     }
 
-                    temp_path = os.path.join(
-                        temp_dir, f"candidate_{global_image_counter}.png"
-                    )
+                    # НОВОЕ НАЗВАНИЕ ФАЙЛОВ С УКАЗАНИЕМ X и Y
+                    fname = f"candidate_p{page_num + 1}_x{missed_coords[0]}_y{missed_coords[1]}.png"
+                    temp_path = os.path.join(temp_dir, fname)
                     self._crop_image(pil_img, missed_coords, padding=5).save(temp_path)
 
                     block["content_path"] = temp_path
-                    block["md_image_name"] = (
-                        f"doc_{doc_id}_image_{global_image_counter}.png"
-                    )
+                    block["md_image_name"] = f"doc_{doc_id}_image_{global_image_counter}.png"
                     global_image_counter += 1
 
                     page_plan["blocks"].append(block)
