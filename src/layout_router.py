@@ -41,7 +41,8 @@ class LayoutRouter:
             "title": 10,
             "section-header": 9,
             "table": 8,
-            
+            "table_merged": 8,
+            "table_borderless": 8,
             "figure": 7,
             "picture": 7,
             "table_caption": 6,
@@ -433,8 +434,13 @@ class LayoutRouter:
             )
             pil_img = Image.fromarray(img_rgb)
 
-            # --- ВНЕДРЕНИЕ ОЧИСТКИ ОТ ШУМА ---
-            img_cv2_denoised = cv2.medianBlur(img_cv2, 3)
+            gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
+
+            is_noisy = self._is_image_noisy(gray, noise_threshold=5000)
+            if is_noisy:
+                img_cv2_ready = cv2.medianBlur(img_cv2, 3)
+            else:
+                img_cv2_ready = img_cv2.copy()
 
             # =====================================================================
             # --- ВНЕДРЕНИЕ: MULTI-SCALE INFERENCE (ДВУХПРОХОДНЫЙ АНСАМБЛЬ) ---
