@@ -28,6 +28,10 @@ dependencies = [
     # HuggingFace Hub
     "huggingface-hub>=0.24.0",
     "dill>=0.4.1",
+    # PaddleOCR — CPU-OCR для RASTER_TEXT (русский), освобождает GPU под VLM.
+    # Не зависит от transformers, не конфликтует с torch==2.6.0.
+    "paddleocr>=2.7.0",
+    "paddlepaddle>=2.5.0",
 ]
 
 [tool.uv.extra-build-dependencies]

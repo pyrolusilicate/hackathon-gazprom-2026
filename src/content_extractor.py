@@ -373,3 +373,101 @@ def filter_noise_lines(text: str, min_chars: int = 3) -> str:
             continue
         lines.append(l)
     return "\n".join(lines).strip()
+
+
+# ---------------------------------------------------------------------------
+# Анти-галлюцинационные валидаторы
+# ---------------------------------------------------------------------------
+
+
+_CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
+_LETTER_RE = re.compile(r"[A-Za-zА-Яа-яЁё]")
+
+
+def cyrillic_ratio(text: str) -> float:
+    """Доля кириллических букв среди всех букв. 0.0 если букв нет."""
+    if not text:
+        return 0.0
+    letters = _LETTER_RE.findall(text)
+    if not letters:
+        return 0.0
+    cyr = _CYRILLIC_RE.findall(text)
+    return len(cyr) / len(letters)
+
+
+def repetition_ratio(text: str) -> float:
+    """Доля повторов самой частой непустой строки среди всех непустых строк."""
+    if not text:
+        return 0.0
+    lines = [l.strip().lower() for l in text.splitlines() if l.strip()]
+    if len(lines) < 4:
+        return 0.0
+    counts: dict[str, int] = {}
+    for ln in lines:
+        counts[ln] = counts.get(ln, 0) + 1
+    return max(counts.values()) / len(lines)
+
+
+def reference_text_for_bbox(
+    pdf_doc: fitz.Document, page_num: int, coords: list, *, pad: float = 5.0
+) -> str:
+    """Текст PDF-слоя по bbox — база для language-drift проверки."""
+    try:
+        page = pdf_doc[page_num]
+        x0, y0, x1, y1 = _to_pdf_rect(coords)
+        rect = fitz.Rect(x0 - pad, y0 - pad, x1 + pad, y1 + pad)
+        return (page.get_text("text", clip=rect) or "").strip()
+    except Exception:
+        return ""
+
+
+def table_stats(md: str) -> dict:
+    """
+    Структурный разбор pipe-markdown таблицы.
+    Возвращает {'n_cols', 'n_rows', 'empty_ratio', 'max_cell', 'row_repeat_ratio'}.
+    Для не-таблиц возвращает n_cols=0.
+    """
+    stats = {
+        "n_cols": 0,
+        "n_rows": 0,
+        "empty_ratio": 0.0,
+        "max_cell": 0,
+        "row_repeat_ratio": 0.0,
+    }
+    if not md:
+        return stats
+
+    rows: list[list[str]] = []
+    for ln in md.splitlines():
+        s = ln.strip()
+        if not s.startswith("|"):
+            continue
+        if re.match(r"^\|\s*:?-{2,}", s):
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        rows.append(cells)
+
+    if not rows:
+        return stats
+
+    n_cols = max(len(r) for r in rows)
+    n_rows = len(rows)
+    total = sum(len(r) for r in rows) or 1
+    empty = sum(1 for r in rows for c in r if not c)
+    max_cell = max((len(c) for r in rows for c in r), default=0)
+
+    # повторы строк (данные → один и тот же ряд дублируется — галлюцинация)
+    row_keys = ["|".join(r) for r in rows]
+    row_counts: dict[str, int] = {}
+    for k in row_keys:
+        row_counts[k] = row_counts.get(k, 0) + 1
+    row_repeat = (max(row_counts.values()) / len(row_keys)) if row_keys else 0.0
+
+    stats.update(
+        n_cols=n_cols,
+        n_rows=n_rows,
+        empty_ratio=empty / total,
+        max_cell=max_cell,
+        row_repeat_ratio=row_repeat,
+    )
+    return stats

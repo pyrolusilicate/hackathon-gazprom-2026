@@ -36,14 +36,19 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).parent))
 
 from content_extractor import (
+    VectorTableStore,
     collect_heading_sizes,
+    cyrillic_ratio,
     detect_heading_level,
     extract_text_block,
     filter_noise_lines,
     format_table_markdown,
     format_text_markdown,
     has_vector_text,
+    reference_text_for_bbox,
     render_block_image,
+    repetition_ratio,
+    table_stats,
 )
 from device import setup_environment
 from layout_router import LayoutRouter
@@ -53,6 +58,7 @@ setup_environment()
 OUTPUT_DIR = "data/output"
 IMAGE_MAX_SIDE = 150
 VLM_RENDER_DPI = 300
+TABLE_RENDER_DPI = 400
 
 FIGURE_LABELS = {"picture", "figure", "image", "missed_raster"}
 TEXT_LABELS = {"text", "plain text", "title", "section-header", "list-item"}
@@ -82,6 +88,18 @@ class Pipeline:
                 print(f"  [WARN] VLM недоступен: {exc}")
                 self.vlm = None
 
+        # PaddleOCR: быстрый CPU-OCR для RASTER_TEXT, освобождает GPU под таблицы/фигуры
+        self.paddle = None
+        try:
+            from paddle_engine import PaddleEngine
+
+            self.paddle = PaddleEngine.get()
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [WARN] PaddleOCR недоступен: {exc}")
+            self.paddle = None
+
+        self.vtable_store: Optional[VectorTableStore] = None
+
         self.images_dir = os.path.join(output_dir, "images")
         os.makedirs(self.images_dir, exist_ok=True)
         os.makedirs(output_dir, exist_ok=True)
@@ -95,6 +113,7 @@ class Pipeline:
         doc_name = Path(pdf_path).stem
         pdf_doc = fitz.open(pdf_path)
 
+        self.vtable_store = VectorTableStore(pdf_doc)
         self._enrich_plan_with_tracks(plan, pdf_doc)
         heading_sizes = collect_heading_sizes(pdf_doc, plan)
 
@@ -118,9 +137,10 @@ class Pipeline:
                 gc.collect()
 
         pdf_doc.close()
+        self.vtable_store = None
 
         parts = _merge_cross_page_tables(flat)
-        markdown = "\n\n".join(parts)
+        markdown = _postprocess_document("\n\n".join(parts))
         md_path = os.path.join(self.output_dir, f"{doc_name}.md")
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(markdown)
@@ -170,7 +190,7 @@ class Pipeline:
                 block["is_vector"] = is_vec
 
                 if btype == "table":
-                    block["track"] = "RASTER_TABLE"
+                    block["track"] = "VECTOR_TABLE" if is_vec else "RASTER_TABLE"
                 elif btype in TEXT_LABELS:
                     block["track"] = "VECTOR_TEXT" if is_vec else "RASTER_TEXT"
                 else:
@@ -208,6 +228,9 @@ class Pipeline:
 
         if track == "VECTOR_TEXT":
             return self._vector_text(btype, coords, page_num, pdf_doc, heading_sizes)
+
+        if track == "VECTOR_TABLE":
+            return self._vector_table(page_num, coords, pdf_doc)
 
         if track == "RASTER_TABLE":
             return self._raster_table(page_num, coords, pdf_doc)
@@ -253,13 +276,27 @@ class Pipeline:
         page_num: int,
         pdf_doc: fitz.Document,
     ) -> str:
-        if self.vlm is None:
+        if self.vlm is None and self.paddle is None:
             return ""
         img = render_block_image(pdf_doc, page_num, coords, dpi=VLM_RENDER_DPI)
-        text = self.vlm.extract_markdown(img).strip()
-        if not text:
-            # Fallback для коротких блоков (4-6 слов), где extract_markdown даёт пустоту
-            text = self.vlm.free_ocr(img).strip()
+        ref = reference_text_for_bbox(pdf_doc, page_num, coords)
+
+        text = ""
+        # PaddleOCR — быстрый CPU-путь для простых текстовых блоков
+        if self.paddle is not None:
+            try:
+                text = self.paddle.ocr_text(img).strip()
+            except Exception:
+                text = ""
+            if text and not _validate_text(text, ref):
+                text = ""
+        # VLM-fallback: если Paddle недоступен или не распознал
+        if not text and self.vlm is not None:
+            vlm_text = self.vlm.extract_markdown(img).strip()
+            if not vlm_text:
+                vlm_text = self.vlm.free_ocr(img).strip()
+            if vlm_text and _validate_text(vlm_text, ref):
+                text = vlm_text
         text = filter_noise_lines(text, min_chars=3)
         if not text:
             return ""
@@ -276,11 +313,50 @@ class Pipeline:
     # ------------------------------------------------------------------
 
     def _raster_table(self, page_num: int, coords: list, pdf_doc: fitz.Document) -> str:
-        if self.vlm is None:
-            return ""
-        img = render_block_image(pdf_doc, page_num, coords, dpi=VLM_RENDER_DPI)
-        md = self.vlm.extract_markdown(img).strip()
-        return _postprocess_table_markdown(md)
+        """
+        Растровая таблица с многоступенчатым fallback:
+          VLM → VectorTableStore → PaddleOCR plain-text → пусто.
+        Любая ступень, провалившая _validate_table, отбрасывается.
+        """
+        img = render_block_image(pdf_doc, page_num, coords, dpi=TABLE_RENDER_DPI)
+        ref = reference_text_for_bbox(pdf_doc, page_num, coords)
+
+        # Ступень 1: VLM
+        if self.vlm is not None:
+            md = _postprocess_table_markdown(self.vlm.extract_markdown(img).strip())
+            if md and _validate_table(md, ref):
+                return md
+
+        # Ступень 2: VectorTableStore с заниженным порогом IoU
+        if self.vtable_store is not None:
+            vec = self.vtable_store.find(page_num + 1, coords, min_iou=0.15)
+            if vec and _validate_table(vec, ref):
+                return vec
+
+        # Ступень 3: Paddle plain-text (без структуры таблицы, но без мусора)
+        if self.paddle is not None:
+            try:
+                text = self.paddle.ocr_text(img).strip()
+            except Exception:
+                text = ""
+            text = filter_noise_lines(text, min_chars=3)
+            if text and _validate_text(text, ref):
+                return text
+
+        return ""
+
+    # ------------------------------------------------------------------
+    # VECTOR_TABLE
+    # ------------------------------------------------------------------
+
+    def _vector_table(self, page_num: int, coords: list, pdf_doc: fitz.Document) -> str:
+        """PyMuPDF find_tables(): идеальный markdown из векторного слоя, VLM — fallback."""
+        if self.vtable_store is not None:
+            md = self.vtable_store.find(page_num + 1, coords)
+            if md:
+                return md
+        # Нет таблицы в векторном слое — fallback-цепочка как у RASTER_TABLE
+        return self._raster_table(page_num, coords, pdf_doc)
 
     # ------------------------------------------------------------------
     # SMART_FIGURE
@@ -303,6 +379,8 @@ class Pipeline:
         if self.vlm is None:
             return self._save_figure(pil_img, md_image_name, alt="image")
 
+        ref = reference_text_for_bbox(pdf_doc, page_num, coords)
+
         raw = ""
         try:
             raw = self.vlm.extract_markdown(pil_img).strip()
@@ -318,15 +396,19 @@ class Pipeline:
         if is_table:
             # Таблицы НЕ сохраняем как PNG: они тяжёлые и метрика их не требует.
             md = _postprocess_table_markdown(raw)
-            if md:
+            if md and _validate_table(md, ref):
                 return md
-            # Постпроцесс не справился — сохраняем как fallback
-            return self._save_figure(pil_img, md_image_name, alt="таблица")
+            # Галлюцинация/битая таблица — сохраняем картинкой без OCR-текста
+            return self._save_figure(pil_img, md_image_name, alt="image")
 
         # Для обычных изображений: ссылка + OCR-текст построчно.
         text = filter_noise_lines(raw, min_chars=3)
         # Убираем из текста строки-мусор вида ![...](...)  которые OCR подхватил из PDF.
         text = _strip_md_image_lines(text)
+
+        # Если OCR-текст не прошёл валидацию — выкидываем его, оставляем картинку
+        if text and not _validate_text(text, ref):
+            text = ""
 
         # alt: первая чистая строка OCR, иначе русская подпись
         alt = _first_clean_line(text)
@@ -441,11 +523,14 @@ def _text_looks_like_table_headers(md: str, n_cols: int) -> bool:
     return all(len(l) <= 60 for l in lines)
 
 
+_TABLE_TRACKS = ("RASTER_TABLE", "VECTOR_TABLE")
+
+
 def _merge_cross_page_tables(flat: list[tuple[str, str, bool]]) -> list[str]:
     """
     Склеивает части таблицы, разрезанной переносом страницы.
-    Два подряд RASTER_TABLE → мержим.
-    TEXT-блок + RASTER_TABLE с совпадающим числом столбцов → text становится заголовком.
+    Два подряд *_TABLE → мержим.
+    TEXT-блок + *_TABLE с совпадающим числом столбцов → text становится заголовком.
     flat — список (track, md, is_last_on_page).
     """
     result: list[str] = []
@@ -457,23 +542,23 @@ def _merge_cross_page_tables(flat: list[tuple[str, str, bool]]) -> list[str]:
         if (
             track in ("VECTOR_TEXT", "RASTER_TEXT")
             and i + 1 < len(flat)
-            and flat[i + 1][0] == "RASTER_TABLE"
+            and flat[i + 1][0] in _TABLE_TRACKS
         ):
-            _, next_md, next_last = flat[i + 1]
+            next_track, next_md, next_last = flat[i + 1]
             pipe_lines = [l for l in next_md.splitlines() if l.strip().startswith("|")]
             if pipe_lines:
                 n_cols = len([c for c in pipe_lines[0].strip().strip("|").split("|")])
                 if _text_looks_like_table_headers(md, n_cols):
                     merged = _merge_two_tables(md, next_md)
-                    flat[i + 1] = ("RASTER_TABLE", merged, next_last)
+                    flat[i + 1] = (next_track, merged, next_last)
                     i += 1
                     continue
 
-        # Два подряд RASTER_TABLE → мержим (продолжение таблицы через страницу)
+        # Два подряд *_TABLE → мержим (продолжение таблицы через страницу)
         while (
-            track == "RASTER_TABLE"
+            track in _TABLE_TRACKS
             and i + 1 < len(flat)
-            and flat[i + 1][0] == "RASTER_TABLE"
+            and flat[i + 1][0] in _TABLE_TRACKS
         ):
             i += 1
             _, next_md, _ = flat[i]
@@ -548,6 +633,59 @@ def _postprocess_table_markdown(md: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Анти-галлюцинационные валидаторы
+# ---------------------------------------------------------------------------
+
+
+def _validate_table(md: str, ref_text: str) -> bool:
+    """
+    Проверяет markdown-таблицу на признаки галлюцинации VLM.
+    Возвращает True, если таблица выглядит здоровой.
+    """
+    if not md:
+        return False
+    stats = table_stats(md)
+    if stats["n_cols"] == 0 or stats["n_rows"] == 0:
+        return False
+    if stats["n_cols"] > 15:
+        return False
+    if stats["n_rows"] > 150:
+        return False
+    if stats["max_cell"] > 300:
+        return False
+    if stats["row_repeat_ratio"] > 0.4 and stats["n_rows"] > 3:
+        return False
+
+    # language drift: референс с кириллицей, а VLM выдал латиницу
+    if ref_text and cyrillic_ratio(ref_text) > 0.3:
+        if cyrillic_ratio(md) < 0.1:
+            return False
+    return True
+
+
+def _validate_text(text: str, ref_text: str) -> bool:
+    """
+    Проверяет plain-text на признаки галлюцинации / language drift.
+    Возвращает True, если текст здоровый.
+    """
+    if not text:
+        return False
+    # Абсурдная длина vs. референс
+    if ref_text:
+        max_allowed = max(500, 10 * len(ref_text))
+        if len(text) > max_allowed:
+            return False
+    # Повторяющийся паттерн (одна фраза 50 раз)
+    if repetition_ratio(text) > 0.5:
+        return False
+    # Translation drift
+    if ref_text and cyrillic_ratio(ref_text) > 0.3:
+        if cyrillic_ratio(text) < 0.1:
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Вспомогательные функции для _smart_figure
 # ---------------------------------------------------------------------------
 
@@ -591,6 +729,96 @@ def _first_clean_line(text: str) -> str:
         if clean:
             return clean
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Rule-based пост-процессор документа
+# ---------------------------------------------------------------------------
+
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
+
+
+def _postprocess_document(text: str) -> str:
+    """
+    Лёгкая детерминированная чистка итогового markdown без LLM.
+    Не меняет смысл — только убирает артефакты сборки.
+
+    Операции (в порядке применения):
+      1. Убрать trailing whitespace с каждой строки.
+      2. Схлопнуть 3+ пустых строки подряд → 2.
+      3. Удалить дублирующиеся соседние абзацы / блоки (одинаковый текст дважды).
+      4. Удалить дублирующиеся соседние заголовки.
+      5. Нормализовать уровни заголовков: минимальный уровень в документе → #.
+    """
+    if not text:
+        return text
+
+    # 1. Trailing whitespace
+    lines = [ln.rstrip() for ln in text.splitlines()]
+
+    # 2. Схлопнуть 3+ пустых строки → 2
+    cleaned: list[str] = []
+    blank_run = 0
+    for ln in lines:
+        if ln == "":
+            blank_run += 1
+            if blank_run <= 2:
+                cleaned.append(ln)
+        else:
+            blank_run = 0
+            cleaned.append(ln)
+    text = "\n".join(cleaned)
+
+    # 3. Дублирующиеся соседние блоки (разделённые пустой строкой)
+    blocks = text.split("\n\n")
+    deduped: list[str] = []
+    prev_block = None
+    for blk in blocks:
+        norm = blk.strip()
+        if norm and norm == prev_block:
+            continue
+        deduped.append(blk)
+        if norm:
+            prev_block = norm
+    text = "\n\n".join(deduped)
+
+    # 4. Дублирующиеся соседние заголовки (один и тот же заголовок 2 раза подряд)
+    lines = text.splitlines()
+    result: list[str] = []
+    prev_heading: str | None = None
+    for ln in lines:
+        m = _HEADING_RE.match(ln)
+        if m:
+            heading_text = m.group(2).strip().lower()
+            if heading_text == prev_heading:
+                continue
+            prev_heading = heading_text
+        else:
+            if ln.strip():
+                prev_heading = None
+        result.append(ln)
+    text = "\n".join(result)
+
+    # 5. Нормализация уровней заголовков: сдвигаем так, чтобы минимальный → #
+    lines = text.splitlines()
+    min_level = 6
+    for ln in lines:
+        m = _HEADING_RE.match(ln)
+        if m:
+            min_level = min(min_level, len(m.group(1)))
+    if min_level > 1:
+        shift = min_level - 1
+        normalized: list[str] = []
+        for ln in lines:
+            m = _HEADING_RE.match(ln)
+            if m:
+                new_level = max(1, len(m.group(1)) - shift)
+                normalized.append("#" * new_level + " " + m.group(2))
+            else:
+                normalized.append(ln)
+        text = "\n".join(normalized)
+
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------

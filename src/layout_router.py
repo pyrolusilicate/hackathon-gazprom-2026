@@ -379,6 +379,31 @@ class LayoutRouter:
         return False
     
     @staticmethod
+    def _is_blank_or_screenshot(pil_crop: Image.Image) -> bool:
+        """
+        True, если кадр выглядит как однотонная заливка или квадратный скриншот
+        страницы, не несущий полезной информации для метрики.
+        """
+        try:
+            arr = np.array(pil_crop.convert("L"))
+        except Exception:
+            return True
+        if arr.size == 0:
+            return True
+
+        # Однотонный фон
+        if float(arr.std()) < 15.0:
+            return True
+
+        # Квадрат + большой размер = вероятный скриншот/плашка
+        h, w = arr.shape[:2]
+        if h >= 250 and w >= 250:
+            ratio = w / h if h else 1.0
+            if 0.85 <= ratio <= 1.18:
+                return True
+        return False
+
+    @staticmethod
     def _is_image_noisy(img_gray: np.ndarray, noise_threshold: int = 3000) -> bool:
         """
         Быстрый детектор точечного шума на основе анализа связных компонент.
@@ -652,7 +677,7 @@ class LayoutRouter:
             for img in physical_images:
                 img_rect = fitz.Rect(img["bbox"])
 
-                if img_rect.width < 50 or img_rect.height < 50:
+                if img_rect.width < 80 or img_rect.height < 80:
                     continue
                 
                 # игнор фоновых изображений
@@ -698,6 +723,13 @@ class LayoutRouter:
                     # убираем дубликаты для растра
                     if is_duplicate(missed_coords):
                         continue
+
+                    # Выбрасываем однотонные заливки и квадратные скриншоты:
+                    # они раздувают images/ и ухудшают min(pred,gold)/max(pred,gold).
+                    preview_crop = self._crop_image(pil_img, missed_coords, padding=5)
+                    if self._is_blank_or_screenshot(preview_crop):
+                        continue
+
                     saved_crops_coords.append(missed_coords)
 
                     block = {
@@ -711,7 +743,7 @@ class LayoutRouter:
                     # НОВОЕ НАЗВАНИЕ ФАЙЛОВ С УКАЗАНИЕМ X и Y
                     fname = f"candidate_p{page_num + 1}_x{missed_coords[0]}_y{missed_coords[1]}.png"
                     temp_path = os.path.join(temp_dir, fname)
-                    self._crop_image(pil_img, missed_coords, padding=5).save(temp_path)
+                    preview_crop.save(temp_path)
 
                     block["content_path"] = temp_path
                     block["md_image_name"] = f"doc_{doc_id}_image_{global_image_counter}.png"

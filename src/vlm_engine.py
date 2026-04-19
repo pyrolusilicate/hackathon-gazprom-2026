@@ -40,8 +40,11 @@ _SIZES_BLOCK = {"base_size": 1024, "image_size": 1024, "crop_mode": False}
 _SIZES_SMALL = {"base_size": 640, "image_size": 640, "crop_mode": False}
 
 # Промпты. Все начинаются с `<image>\n` — этого требует чат-шаблон DeepSeek-OCR.
-PROMPT_MARKDOWN = "<image>\n<|grounding|>Convert the document to markdown. "
-PROMPT_FREE_OCR = "<image>\nFree OCR. "
+PROMPT_MARKDOWN = (
+    "<image>\n<|grounding|>Convert the document to markdown. "
+    "Preserve original language. "
+)
+PROMPT_FREE_OCR = "<image>\nFree OCR. Preserve original language. "
 PROMPT_PARSE_FIGURE = "<image>\nParse the figure. "
 PROMPT_DESCRIBE_RU = "<image>\nОпиши изображение одной фразой на русском (до 10 слов). "
 PROMPT_CLASSIFY = (
@@ -65,6 +68,36 @@ def _strip_special_tokens(text: str) -> str:
     text = _TAG_RE.sub("", text)
     text = _FENCE_RE.sub("", text)
     return text.strip()
+
+
+_MAX_VLM_OUTPUT = 12000
+
+
+def _truncate_repetitive(text: str, max_repeat: int = 8) -> str:
+    """
+    Отсекает классическую галлюцинацию DeepSeek-OCR: одна строка повторяется
+    сотни раз подряд. Оставляем первые `max_repeat` появлений, остальное
+    выбрасываем. Также режем на жёстком пределе длины.
+    """
+    if not text:
+        return text
+    out: list[str] = []
+    last = None
+    streak = 0
+    for ln in text.splitlines():
+        norm = ln.strip().lower()
+        if norm and norm == last:
+            streak += 1
+            if streak >= max_repeat:
+                continue
+        else:
+            last = norm
+            streak = 0
+        out.append(ln)
+    joined = "\n".join(out)
+    if len(joined) > _MAX_VLM_OUTPUT:
+        joined = joined[:_MAX_VLM_OUTPUT]
+    return joined
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +265,7 @@ class VLMEngine:
                 except OSError:
                     pass
 
-        return _strip_special_tokens(str(text))
+        return _truncate_repetitive(_strip_special_tokens(str(text)))
 
     # ---- высокоуровневое API -----------------------------------------
 
