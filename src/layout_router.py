@@ -1,321 +1,311 @@
+"""
+Layout-роутер: DocLayout-YOLOv10 + детерминированный reading order.
+
+Multi-scale inference (imgsz=1280 + imgsz=2400):
+  - 1280 — надёжные глобальные якоря, широкие таблицы не режутся
+  - 2400 — лупа: разделяет соседние таблицы если покрытие ≥ 95%
+
+IoM NMS с приоритетом класса (title > section-header > table > figure > text).
+
+Reading order:
+  1. Логические блоки: фигура/таблица + ближайшая подпись → неразрывно.
+  2. Горизонтальные полосы: блоки с пересечением по Y объединяются.
+  3. Колонки внутри полос (horizontal overlap > 30%), слева-направо.
+  4. Внутри колонки — сверху вниз.
+
+Missed rasters: растровые объекты PDF, пропущенные YOLO, добавляются как "picture".
+
+Возвращает:
+    {
+      "doc_id": "51",
+      "pdf_path": "...",
+      "pages": [
+        {"page_num": 1, "width": 2480, "height": 3508, "blocks": [
+            {"type": "title", "coords": [x1,y1,x2,y2], "conf": 0.93, "md_image_name": null},
+            ...
+        ]},
+        ...
+      ]
+    }
+"""
+
+from __future__ import annotations
+
 import argparse
 import json
 import os
+import re
+from pathlib import Path
+from typing import Optional
 
 import cv2
 import fitz
 import numpy as np
 import torch
-from doclayout_yolo import YOLOv10
-from huggingface_hub import hf_hub_download
 from PIL import Image
 
 from config import LAYOUT_DPI, LAYOUT_TO_PDF, PDF_TO_LAYOUT
-from device import get_torch_device, setup_environment
+from device import get_torch_device
 
-_original_load = torch.load
-torch.load = lambda *args, **kwargs: _original_load(
-    *args, **{**kwargs, "weights_only": False}
-)
+# PyTorch <2.6 совместимость при загрузке весов
+_orig_torch_load = torch.load
+torch.load = lambda *a, **kw: _orig_torch_load(*a, **{**kw, "weights_only": False})
 
-setup_environment()
+# px (LAYOUT_DPI) ↔ pt (72 DPI)
+_PX_TO_PT = PDF_TO_LAYOUT   # пиксели → PDF points
+_PT_TO_PX = LAYOUT_TO_PDF   # PDF points → пиксели
 
-weights_name_file = "doclayout_yolo_docstructbench_imgsz1280_2501.pt"
+_WEIGHTS_FILE = "doclayout_yolo_docstructbench_imgsz1280_2501.pt"
+_WEIGHTS_DIR = "weights"
+
+_FIGURE_LABELS = {"picture", "figure", "image"}
+_TEXT_LABELS = {"text", "plain text", "plain-text", "title", "section-header", "list-item"}
+_TABLE_LABELS = {"table", "table_merged", "table_borderless"}
+
+_IGNORE_CLASSES = {"page-header", "page-footer", "footnote", "watermark", "abandon"}
+
+_CLASS_PRIORITY = {
+    "title": 10,
+    "section-header": 9,
+    "table": 8,
+    "table_merged": 8,
+    "table_borderless": 8,
+    "figure": 7,
+    "picture": 7,
+    "image": 7,
+    "table_caption": 6,
+    "figure_caption": 6,
+    "caption": 6,
+    "list-item": 5,
+    "text": 4,
+    "plain text": 4,
+    "plain-text": 4,
+}
+
+
+# ---------------------------------------------------------------------------
 
 
 class LayoutRouter:
-    def __init__(self, weights_dir: str = "weights"):
+    def __init__(self, weights_dir: str = _WEIGHTS_DIR):
         self.weights_dir = weights_dir
         self.device = get_torch_device()
-        self.model = self._load_model()
-        self.ignore_classes = {
-            "page-header",
-            "page-footer",
-            "footnote",
-            "watermark",
-            "abandon",
-        }
-        self.vlm_candidates = {"picture", "figure", "image"}
-        # Приоритет при NMS: при перекрытии оставляем класс с бо́льшим приоритетом
-        self._class_priority = {
-            "title": 10,
-            "section-header": 9,
-            "table": 8,
-            "table_merged": 8,
-            "table_borderless": 8,
-            "figure": 7,
-            "picture": 7,
-            "table_caption": 6,
-            "figure_caption": 6,
-            "caption": 6,
-            "list-item": 5,
-            "text": 4,
-            "plain text": 4,
-        }
+        self._model = None
 
-    def _load_model(self) -> YOLOv10:
+    def _load(self) -> None:
+        if self._model is not None:
+            return
+        from doclayout_yolo import YOLOv10
+        from huggingface_hub import hf_hub_download
+
         os.makedirs(self.weights_dir, exist_ok=True)
-        weights_path = os.path.join(self.weights_dir, weights_name_file)
+        weights_path = os.path.join(self.weights_dir, _WEIGHTS_FILE)
         if not os.path.exists(weights_path):
             hf_hub_download(
                 repo_id="juliozhao/DocLayout-YOLO-DocStructBench",
-                filename=weights_name_file,
+                filename=_WEIGHTS_FILE,
                 local_dir=self.weights_dir,
             )
-        return YOLOv10(weights_path)
+        self._model = YOLOv10(weights_path)
+        print(f"  [YOLO] DocLayout ready ({self.device})")
 
-    def get_document_id(self, filename: str) -> str:
-        base_name = os.path.basename(filename)
+    # ---- публичный API ---------------------------------------------------
+
+    def build_routing_plan(
+        self, pdf_path: str, output_dir: str, visualize: bool = False
+    ) -> dict:
+        self._load()
+        doc_name = Path(pdf_path).stem
+        doc_id = _doc_id_from_name(doc_name)
+
+        vis_dir: Optional[str] = None
+        if visualize:
+            vis_dir = os.path.join("data", "visualization", f"document_{doc_id}")
+            os.makedirs(vis_dir, exist_ok=True)
+
+        pdf_doc = fitz.open(pdf_path)
+        pages_out: list[dict] = []
+        global_img_counter = 1
+
         try:
-            return str(int(base_name.replace("document_", "").replace(".pdf", "")))
-        except ValueError:
-            return base_name.replace(".pdf", "")
+            for page_idx, page in enumerate(pdf_doc):
+                page_num_1 = page_idx + 1
 
-    def _sort_reading_order(
-        self, boxes: list, page_width: float, page_height: float
-    ) -> list:
-        if not boxes:
-            return []
-
-        parsed_boxes = []
-        for box in boxes:
-            coords = box.xyxy[0].tolist()
-            cls_name = self.model.names[int(box.cls[0])].lower()
-            parsed_boxes.append(
-                {
-                    "box": box,
-                    "x1": coords[0],
-                    "y1": coords[1],
-                    "x2": coords[2],
-                    "y2": coords[3],
-                    "w": coords[2] - coords[0],
-                    "h": coords[3] - coords[1],
-                    "cls": cls_name,
-                }
-            )
-
-        # 1. Фильтрация колонтитулов
-        margin_top = page_height * 0.05
-        margin_bottom = page_height * 0.95
-        filtered_boxes = []
-        for b in parsed_boxes:
-            if b["cls"] in ["page-header", "page-footer"]:
-                continue
-            if b["cls"] in ["text", "plain text", "title"]:
-                if b["y2"] < margin_top or b["y1"] > margin_bottom:
-                    continue
-            filtered_boxes.append(b)
-
-        # Первичная сортировка сверху вниз
-        filtered_boxes.sort(key=lambda x: x["y1"])
-
-        # 2. ЛОГИЧЕСКАЯ ПРЕ-СКЛЕЙКА (Figure/Table + Caption)
-        # Связываем медиа-объекты с их подписями в единые неразрывные блоки
-        logical_blocks = []
-        used_indices = set()
-
-        for i, b in enumerate(filtered_boxes):
-            if i in used_indices:
-                continue
-
-            current_logical = [b]
-            used_indices.add(i)
-
-            base_box = b
-            for j in range(i + 1, len(filtered_boxes)):
-                if j in used_indices:
-                    continue
-                next_box = filtered_boxes[j]
-
-                # Расстояние по вертикали
-                y_gap = next_box["y1"] - base_box["y2"]
-
-                # Доля пересечения по X
-                overlap_x = max(
-                    0,
-                    min(base_box["x2"], next_box["x2"])
-                    - max(base_box["x1"], next_box["x1"]),
+                # Рендер на LAYOUT_DPI
+                scale = LAYOUT_DPI / 72.0
+                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                img_rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+                    pix.height, pix.width, pix.n
                 )
-                min_w = min(base_box["w"], next_box["w"])
-                x_ratio = overlap_x / min_w if min_w > 0 else 0
+                if pix.n == 4:
+                    img_rgb = img_rgb[:, :, :3]
+                img_cv2 = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+                pil_img = Image.fromarray(img_rgb)
+                page_w, page_h = pil_img.size
 
-                is_parent_media = base_box["cls"] in [
-                    "figure",
-                    "picture",
-                    "image",
-                    "table",
-                    "table_merged",
-                    "table_borderless",
-                ]
-                # Расширяем: клеим и caption, и обычный текст, если он явно работает как подпись
-                is_valid_child = next_box["cls"] in [
-                    "figure_caption",
-                    "table_caption",
-                    "caption",
-                    "text",
-                    "plain text",
-                ]
+                gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
 
-                # Если блок находится близко под картинкой/таблицей и сильно выровнен по ширине
-                if y_gap < page_height * 0.08 and x_ratio > 0.5:
-                    if is_parent_media and is_valid_child:
-                        current_logical.append(next_box)
-                        used_indices.add(j)
-                        base_box = (
-                            next_box  # Сдвигаем низ для возможной многострочной подписи
-                        )
-                    else:
-                        break  # Обычные абзацы не склеиваем жестко
-                elif y_gap >= page_height * 0.08:
-                    pass  # Ушли слишком далеко вниз
+                # Шумоподавление
+                img_ready = cv2.medianBlur(img_cv2, 3) if _is_image_noisy(gray) else img_cv2
 
-            # Формируем габариты объединенного логического блока
-            logical_blocks.append(
-                {
-                    "boxes": current_logical,
-                    "x1": min(cb["x1"] for cb in current_logical),
-                    "y1": min(cb["y1"] for cb in current_logical),
-                    "x2": max(cb["x2"] for cb in current_logical),
-                    "y2": max(cb["y2"] for cb in current_logical),
-                    "w": max(cb["x2"] for cb in current_logical)
-                    - min(cb["x1"] for cb in current_logical),
-                    "h": max(cb["y2"] for cb in current_logical)
-                    - min(cb["y1"] for cb in current_logical),
-                }
-            )
+                # Multi-scale inference + IoM NMS + reading order
+                raw_boxes = self._multi_scale_predict(img_ready)
+                nms_boxes = self._apply_nms(raw_boxes)
+                sorted_boxes = self._sort_reading_order(nms_boxes, page_w, page_h)
 
-        # 3. Формирование горизонтальных полос (Bands) на основе Y-проекции
-        bands = []
-        current_band = []
-        band_bottom = 0
+                if visualize and vis_dir:
+                    _visualize(img_cv2, sorted_boxes, self._model.names, vis_dir, page_num_1)
 
-        for lb in logical_blocks:
-            lb_width = lb["w"]
-            # Широкие блоки (> 55% страницы) или заголовки всегда разрывают полосу
-            is_full_width = lb_width > page_width * 0.55
-            is_title_class = any(
-                b["cls"] in ["title", "section-header"] for b in lb["boxes"]
-            )
+                blocks: list[dict] = []
+                saved_coords: list[list[int]] = []
 
-            if is_full_width or is_title_class:
-                # Если уже что-то копили - закрываем старую полосу
-                if current_band:
-                    bands.append(current_band)
-                # Широкий элемент идет своей собственной полосой
-                bands.append([lb])
-                current_band = []
-                band_bottom = 0
-            else:
-                if not current_band:
-                    current_band.append(lb)
-                    band_bottom = lb["y2"]
-                else:
-                    # Если верхняя граница блока лежит выше "дна" текущей полосы 
-                    # (с допуском 3% высоты страницы на кривизну скана), он в той же полосе.
-                    # Это позволяет собирать длинные и короткие колонки вместе!
-                    if lb["y1"] <= band_bottom + (page_height * 0.03):
-                        current_band.append(lb)
-                        # Расширяем "дно" полосы
-                        band_bottom = max(band_bottom, lb["y2"])
-                    else:
-                        # Ушли слишком далеко вниз - начинаем новую полосу
-                        bands.append(current_band)
-                        current_band = [lb]
-                        band_bottom = lb["y2"]
-        
-        if current_band:
-            bands.append(current_band)
+                for box in sorted_boxes:
+                    coords = [int(c) for c in box.xyxy[0].tolist()]
+                    label = self._model.names[int(box.cls[0])].lower()
 
-        # 4. Формирование колонок внутри полос и итоговая распаковка
-        final_sorted = []
-        for band in bands:
-            columns = []
-            
-            for lb in band:
-                placed = False
-                for col in columns:
-                    col_x1 = min(cb["x1"] for cb in col)
-                    col_x2 = max(cb["x2"] for cb in col)
-                    col_w = col_x2 - col_x1
-                    
-                    overlap = max(0, min(lb["x2"], col_x2) - max(lb["x1"], col_x1))
-                    min_w = min(lb["w"], col_w)
-                    
-                    # Если блок пересекается с существующей колонкой по оси X хотя бы на 30%
-                    if min_w > 0 and (overlap / min_w) > 0.3:
-                        col.append(lb)
-                        placed = True
-                        break
-                
-                # Если не пересекается ни с одной - это новая колонка
-                if not placed:
-                    columns.append([lb])
-            
-            # Сортируем колонки строго слева направо
-            columns.sort(key=lambda col: min(cb["x1"] for cb in col))
+                    if label in _IGNORE_CLASSES:
+                        continue
+                    if _is_box_empty(coords, gray):
+                        continue
+                    # Игнорируем цельностраничные блоки (фон/весь лист)
+                    box_area = (coords[2] - coords[0]) * (coords[3] - coords[1])
+                    if box_area / (page_w * page_h) > 0.75:
+                        continue
 
-            for col in columns:
-                # Внутри каждой колонки сортируем блоки строго сверху вниз
-                col.sort(key=lambda lb: lb["y1"])
+                    md_image_name: Optional[str] = None
+                    if label in _FIGURE_LABELS:
+                        md_image_name = f"doc_{doc_id}_image_{global_img_counter}.png"
+                        global_img_counter += 1
+                    # Все блоки попадают в saved_coords, чтобы _find_missed_rasters
+                    # не добавлял растр поверх уже покрытой таблицей/текстом области
+                    saved_coords.append(coords)
 
-                for lb in col:
-                    # Распаковываем физические боксы (они уже отсортированы логикой на Шаге 2)
-                    for phys_box in lb["boxes"]:
-                        final_sorted.append(phys_box["box"])
+                    blocks.append({
+                        "type": label,
+                        "coords": coords,
+                        "conf": float(box.conf[0]),
+                        "md_image_name": md_image_name,
+                    })
 
-        return final_sorted
+                # Растровые объекты пропущенные YOLO
+                missed = _find_missed_rasters(
+                    page, pil_img, sorted_boxes, saved_coords, doc_id, global_img_counter
+                )
+                for blk in missed:
+                    blocks.append(blk)
+                    global_img_counter += 1
 
-    @staticmethod
-    def _cluster_centers(centers: list[float], gap: float) -> list[dict]:
+                pages_out.append({
+                    "page_num": page_num_1,
+                    "width": page_w,
+                    "height": page_h,
+                    "blocks": blocks,
+                })
+        finally:
+            pdf_doc.close()
+
+        return {"doc_id": doc_id, "pdf_path": pdf_path, "pages": pages_out}
+
+    # ---- inference -------------------------------------------------------
+
+    def _multi_scale_predict(self, img: np.ndarray) -> list:
         """
-        Жадная 1D-кластеризация: соседние точки, расстояние между которыми
-        меньше `gap`, идут в один кластер. Возвращает [{center, count}, ...].
+        Двухпроходный ансамбль.
+        Если 2400-лупа нашла ≥2 субтаблиц внутри 1280-таблицы с покрытием ≥95%
+        и шириной >94.5% — берём субтаблицы. Иначе доверяем 1280.
         """
-        if not centers:
-            return []
-        clusters: list[list[float]] = [[centers[0]]]
-        for c in centers[1:]:
-            if c - clusters[-1][-1] <= gap:
-                clusters[-1].append(c)
+        res_1280 = self._model.predict(
+            img, imgsz=1280, conf=0.165, device=self.device, verbose=False
+        )[0]
+        res_2400 = self._model.predict(
+            img, imgsz=2400, conf=0.165, device=self.device, verbose=False
+        )[0]
+
+        table_cls = _TABLE_LABELS
+        parsed_2400 = [
+            {
+                "coords": b.xyxy[0].tolist(),
+                "cls": self._model.names[int(b.cls[0])].lower(),
+                "box": b,
+            }
+            for b in (res_2400.boxes or [])
+        ]
+        used_2400: set[int] = set()
+        final: list = []
+
+        for b in (res_1280.boxes or []):
+            coords = b.xyxy[0].tolist()
+            label = self._model.names[int(b.cls[0])].lower()
+
+            if label not in table_cls:
+                final.append(b)
+                continue
+
+            internal = [
+                i for i, p in enumerate(parsed_2400)
+                if i not in used_2400
+                and p["cls"] in table_cls
+                and _ioa(p["coords"], coords) > 0.8
+            ]
+
+            if len(internal) >= 2:
+                h = coords[3] - coords[1]
+                w = coords[2] - coords[0]
+                cov = sum(
+                    parsed_2400[i]["coords"][3] - parsed_2400[i]["coords"][1]
+                    for i in internal
+                )
+                min_w = min(
+                    parsed_2400[i]["coords"][2] - parsed_2400[i]["coords"][0]
+                    for i in internal
+                )
+                if h > 0 and cov / h >= 0.95 and (w == 0 or min_w / w > 0.945):
+                    for i in internal:
+                        final.append(parsed_2400[i]["box"])
+                        used_2400.add(i)
+                    continue
+                # Лупа дала неполное покрытие → доверяем 1280
+                for i in internal:
+                    used_2400.add(i)
             else:
-                clusters.append([c])
-        return [{"center": sum(cl) / len(cl), "count": len(cl)} for cl in clusters]
+                for i in internal:
+                    used_2400.add(i)
+
+            final.append(b)
+
+        # Независимые 2400-боксы (не поглощённые 1280-якорями)
+        for i, p in enumerate(parsed_2400):
+            if i not in used_2400:
+                final.append(p["box"])
+
+        return final
+
+    # ---- NMS -------------------------------------------------------------
 
     def _apply_nms(self, boxes: list, iom_threshold: float = 0.7) -> list:
-        """
-        Intersection-over-Min-Area NMS: удаляет боксы, у которых
-        >iom_threshold площади перекрывается с уже принятым боксом.
-        Приоритет: класс-приоритет, затем confidence.
-        """
+        """IoM NMS: удаляем бокс если >iom_threshold его площади перекрыто более приоритетным."""
         if not boxes:
-            return boxes
+            return []
 
-        def priority(box):
-            cls = self.model.names[int(box.cls[0])].lower()
-            base_prio = self._class_priority.get(cls, 3)
-            
-            # --- УБИЙЦА ФЕЙКОВЫХ ФИГУР ---
-            # Если YOLO придумал картинку/фигуру, но вес мусорный (< 0.4),
-            # роняем ее приоритет до 2 (ниже, чем у plain text). 
-            if cls in {"figure", "picture", "image"} and float(box.conf[0]) < 0.4:
-                base_prio = 2
-                
-            return base_prio, float(box.conf[0])
+        def _priority(b) -> tuple[int, float]:
+            cls = self._model.names[int(b.cls[0])].lower()
+            p = _CLASS_PRIORITY.get(cls, 3)
+            # Штраф: низко-уверенные figure не должны убивать текстовые блоки
+            if cls in _FIGURE_LABELS and float(b.conf[0]) < 0.4:
+                p = 2
+            return p, float(b.conf[0])
 
-        sorted_boxes = sorted(boxes, key=priority, reverse=True)
         kept: list = []
-
-        for box in sorted_boxes:
+        for box in sorted(boxes, key=_priority, reverse=True):
             x1, y1, x2, y2 = box.xyxy[0].tolist()
             area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
             if area == 0:
                 continue
-
             dominated = False
             for kb in kept:
                 kx1, ky1, kx2, ky2 = kb.xyxy[0].tolist()
-                ix1, iy1 = max(x1, kx1), max(y1, ky1)
-                ix2, iy2 = min(x2, kx2), min(y2, ky2)
+                ix1 = max(x1, kx1); iy1 = max(y1, ky1)
+                ix2 = min(x2, kx2); iy2 = min(y2, ky2)
                 if ix2 <= ix1 or iy2 <= iy1:
                     continue
                 inter = (ix2 - ix1) * (iy2 - iy1)
@@ -324,492 +314,293 @@ class LayoutRouter:
                 if min_area > 0 and inter / min_area > iom_threshold:
                     dominated = True
                     break
-
             if not dominated:
                 kept.append(box)
-
         return kept
 
-    def _crop_image(
-        self, img: Image.Image, coords: list, padding: int = 0
-    ) -> Image.Image:
-        x1 = max(0, coords[0] - padding)
-        y1 = max(0, coords[1] - padding)
-        x2 = min(img.width, coords[2] + padding)
-        y2 = min(img.height, coords[3] + padding)
-        return img.crop((x1, y1, x2, y2))
-    
-    @staticmethod
-    def _is_box_empty(coords: list, gray_img: np.ndarray) -> bool:
+    # ---- reading order ---------------------------------------------------
+
+    def _sort_reading_order(self, boxes: list, page_w: int, page_h: int) -> list:
         """
-        Анализирует пиксели внутри бокса. Если там только фон или мелкая пыль — возвращает True.
+        Band-based reading order:
+          1. Логические блоки: медиа + подпись склеиваются.
+          2. Полосы: блоки с пересечением Y (допуск 3%) объединяются.
+          3. Колонки внутри полос (overlap > 30%), слева-направо, внутри — по Y.
         """
-        x1, y1, x2, y2 = map(int, coords)
-        
-        # Делаем отступ внутрь на 5 пикселей. Это нужно, чтобы случайно не 
-        # зацепить хвост длинной буквы из соседнего (настоящего) абзаца.
-        margin = 5
-        x1_c, y1_c = min(x1 + margin, x2), min(y1 + margin, y2)
-        x2_c, y2_c = max(x1, x2 - margin), max(y1, y2 - margin)
-        
-        crop = gray_img[y1_c:y2_c, x1_c:x2_c]
-        
-        # Если бокс был настолько узким, что после отступа схлопнулся
-        if crop.size == 0 or crop.shape[0] < 5 or crop.shape[1] < 5:
-            return True
-            
-        # Бинаризуем вырезанный кусок
-        _, thresh = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        
-        # Ищем все независимые объекты внутри бокса
-        num_labels, _, stats, _ = cv2.connectedComponentsWithStats(thresh, connectivity=8)
-        
-        if num_labels <= 1:
-            return True # Внутри только белый фон
-            
-        # Достаем площади всех объектов (исключая фон - индекс 0)
-        areas = stats[1:, cv2.CC_STAT_AREA]
-        max_area = np.max(areas)
-        
-        # Настоящая буква при DPI 1280 занимает ощутимую площадь.
-        # Если самая крупная деталь меньше 35 пикселей — это просто скопление пыли.
-        if max_area < 35:
-            return True
-            
-        return False
-    
-    @staticmethod
-    def _is_blank_or_screenshot(pil_crop: Image.Image) -> bool:
-        """
-        True, если кадр выглядит как однотонная заливка или квадратный скриншот
-        страницы, не несущий полезной информации для метрики.
-        """
-        try:
-            arr = np.array(pil_crop.convert("L"))
-        except Exception:
-            return True
-        if arr.size == 0:
-            return True
+        if not boxes:
+            return []
 
-        # Однотонный фон
-        if float(arr.std()) < 15.0:
-            return True
+        parsed = []
+        for box in boxes:
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            parsed.append({
+                "box": box,
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "w": x2 - x1, "h": y2 - y1,
+                "cls": self._model.names[int(box.cls[0])].lower(),
+            })
 
-        # Квадрат + большой размер = вероятный скриншот/плашка
-        h, w = arr.shape[:2]
-        if h >= 250 and w >= 250:
-            ratio = w / h if h else 1.0
-            if 0.85 <= ratio <= 1.18:
-                return True
-        return False
+        # Убираем колонтитулы по позиции (дополнительный фильтр к ignore_classes)
+        m_top = page_h * 0.05
+        m_bot = page_h * 0.95
+        filtered = []
+        for b in parsed:
+            if b["cls"] in {"page-header", "page-footer"}:
+                continue
+            if b["cls"] in {"text", "plain text", "plain-text", "title"}:
+                if b["y2"] < m_top or b["y1"] > m_bot:
+                    continue
+            filtered.append(b)
+        filtered.sort(key=lambda x: x["y1"])
 
-    @staticmethod
-    def _is_image_noisy(img_gray: np.ndarray, noise_threshold: int = 3000) -> bool:
-        """
-        Быстрый детектор точечного шума на основе анализа связных компонент.
-        Если на картинке больше `noise_threshold` микро-точек, она считается шумной.
-        """
-        # Быстрая бинаризация Оцу
-        _, thresh = cv2.threshold(img_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        
-        # Ищем все связные компоненты
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(thresh, connectivity=8)
-        
-        # Вытаскиваем столбец с площадями всех найденных объектов
-        areas = stats[:, cv2.CC_STAT_AREA]
-        
-        # Считаем "пыль": объекты с площадью от 1 до 10 пикселей.
-        # Индекс 0 пропускаем, так как это всегда фон.
-        noise_dots_count = np.sum((areas[1:] > 0) & (areas[1:] <= 10))
-        
-        return noise_dots_count > noise_threshold
-
-    def build_routing_plan(
-        self, pdf_path: str, output_dir: str = "data/output", visualize: bool = False
-    ) -> dict:
-        doc_id = self.get_document_id(pdf_path)
-
-        temp_dir = os.path.join(output_dir, "temp", f"document_{doc_id}")
-        os.makedirs(temp_dir, exist_ok=True)
-
-        vis_dir = None
-        if visualize:
-            vis_dir = os.path.join("data", "visualization", f"document_{doc_id}")
-            os.makedirs(vis_dir, exist_ok=True)
-
-        doc = fitz.open(pdf_path)
-        routing_plan = {
-            "doc_id": doc_id,
-            "pdf_path": os.path.abspath(pdf_path),
-            "pages": [],
-        }
-        global_image_counter = 1
-
-        for page_num, page in enumerate(doc):
-            pix = page.get_pixmap(dpi=LAYOUT_DPI)
-            img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-                pix.height, pix.width, pix.n
-            )
-
-            img_cv2 = cv2.cvtColor(
-                img_array, cv2.COLOR_RGBA2BGR if pix.n == 4 else cv2.COLOR_RGB2BGR
-            )
-            img_rgb = (
-                cv2.cvtColor(img_array, cv2.COLOR_RGBA2RGB) if pix.n == 4 else img_array
-            )
-            pil_img = Image.fromarray(img_rgb)
-
-            gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
-
-            is_noisy = self._is_image_noisy(gray, noise_threshold=5000)
-            if is_noisy:
-                img_cv2_ready = cv2.medianBlur(img_cv2, 3)
-            else:
-                img_cv2_ready = img_cv2.copy()
-
-            # =====================================================================
-            # --- ВНЕДРЕНИЕ: MULTI-SCALE INFERENCE (ДВУХПРОХОДНЫЙ АНСАМБЛЬ) ---
-            # =====================================================================
-
-            def get_ioa(box_small, box_large):
-                """Вычисляет, какой процент площади box_small находится внутри box_large"""
-                x_left = max(box_small[0], box_large[0])
-                y_top = max(box_small[1], box_large[1])
-                x_right = min(box_small[2], box_large[2])
-                y_bottom = min(box_small[3], box_large[3])
-
-                if x_right < x_left or y_bottom < y_top:
-                    return 0.0
-
-                inter_area = (x_right - x_left) * (y_bottom - y_top)
-                small_area = (box_small[2] - box_small[0]) * (
-                    box_small[3] - box_small[1]
-                )
-                return inter_area / small_area if small_area > 0 else 0
-
-            # 1. Глобальный проход (надежные границы, широкие таблицы не режутся)
-            res_1280 = self.model.predict(
-                img_cv2_ready,
-                imgsz=1280,
-                conf=0.165,
-                device=self.device,
-                verbose=False,
-            )[0]
-
-            # 2. Детальный проход (лупа для поиска разделений между таблицами)
-            res_2400 = self.model.predict(
-                img_cv2_ready,
-                imgsz=2400,
-                conf=0.165,
-                device=self.device,
-                verbose=False,
-            )[0]
-
-            final_boxes = []
-
-            # Парсим боксы из 2400 для быстрого поиска
-            boxes_2400_parsed = []
-            for b in res_2400.boxes:
-                boxes_2400_parsed.append(
-                    {
-                        "coords": b.xyxy[0].tolist(),
-                        "cls": self.model.names[int(b.cls[0])].lower(),
-                        "box_obj": b,
-                    }
-                )
-
-            # Группа всех табличных классов
-            table_classes = {"table", "table_merged", "table_borderless"}
-
-            # Проходимся по глобальным якорям (1280)
-            for b_1280 in res_1280.boxes:
-                coords_1280 = b_1280.xyxy[0].tolist()
-                cls_1280 = self.model.names[int(b_1280.cls[0])].lower()
-
-                if cls_1280 in table_classes:
-                    # Ищем все боксы из прохода 2400
-                    internal_boxes = [
-                        b2400
-                        for b2400 in boxes_2400_parsed
-                        if b2400["cls"] in table_classes
-                        and get_ioa(b2400["coords"], coords_1280) > 0.8
-                    ]
-
-                    if len(internal_boxes) >= 2:
-                        height_1280 = coords_1280[3] - coords_1280[1]
-                        width_1280 = coords_1280[2] - coords_1280[0]
-                        
-                        covered_height = sum(b["coords"][3] - b["coords"][1] for b in internal_boxes)
-                        min_width_2400 = min(b["coords"][2] - b["coords"][0] for b in internal_boxes)
-                        
-                        coverage_ratio = covered_height / height_1280 if height_1280 > 0 else 0
-                        width_ratio = min_width_2400 / width_1280 if width_1280 > 0 else 0
-                        
-                        if coverage_ratio >= 0.95 and width_ratio > 0.945:
-                            # Лупа отработала чисто, забираем разрезанные куски
-                            for internal in internal_boxes:
-                                final_boxes.append(internal["box_obj"])
-                                if internal in boxes_2400_parsed:
-                                    boxes_2400_parsed.remove(internal)
-                        else:
-                            # Лупа потеряла часть данных. Доверяем глобальному проходу 1280.
-                            final_boxes.append(b_1280)
-                            # КРИТИЧЕСКИЙ ФИКС: Обязательно вычищаем бракованные куски лупы, 
-                            # чтобы они не убили правильный 1280 бокс внутри NMS!
-                            for internal in internal_boxes:
-                                if internal in boxes_2400_parsed:
-                                    boxes_2400_parsed.remove(internal)
-                    else:
-                        # Нашли 1 или 0 внутренних кусков. Доверяем 1280.
-                        final_boxes.append(b_1280)
-                        # Тоже зачищаем от греха подальше
-                        for internal in internal_boxes:
-                            if internal in boxes_2400_parsed:
-                                boxes_2400_parsed.remove(internal)
+        # Логические блоки: медиа + ближайшая подпись
+        logical_blocks: list[dict] = []
+        used: set[int] = set()
+        media_cls = _FIGURE_LABELS | _TABLE_LABELS
+        caption_cls = {"figure_caption", "table_caption", "caption", "text", "plain text"}
+        for i, b in enumerate(filtered):
+            if i in used:
+                continue
+            group = [b]
+            used.add(i)
+            base = b
+            for j in range(i + 1, len(filtered)):
+                if j in used:
+                    continue
+                nxt = filtered[j]
+                y_gap = nxt["y1"] - base["y2"]
+                if y_gap >= page_h * 0.08:
+                    break
+                ov_x = max(0.0, min(base["x2"], nxt["x2"]) - max(base["x1"], nxt["x1"]))
+                min_w = min(base["w"], nxt["w"])
+                x_ratio = ov_x / min_w if min_w > 0 else 0.0
+                if base["cls"] in media_cls and nxt["cls"] in caption_cls and x_ratio > 0.5:
+                    group.append(nxt)
+                    used.add(j)
+                    base = nxt
                 else:
-                    final_boxes.append(b_1280)
+                    break
+            logical_blocks.append({
+                "boxes": group,
+                "x1": min(g["x1"] for g in group),
+                "y1": min(g["y1"] for g in group),
+                "x2": max(g["x2"] for g in group),
+                "y2": max(g["y2"] for g in group),
+                "w": max(g["x2"] for g in group) - min(g["x1"] for g in group),
+                "h": max(g["y2"] for g in group) - min(g["y1"] for g in group),
+            })
 
-            # Спасаем только те боксы 2400, которые реально независимы от 1280
-            for b2400 in boxes_2400_parsed:
-                final_boxes.append(b2400["box_obj"])
+        # Полосы
+        bands: list[list[dict]] = []
+        current_band: list[dict] = []
+        band_bot = 0.0
+        for lb in logical_blocks:
+            is_full = lb["w"] > page_w * 0.55
+            is_title = any(b["cls"] in {"title", "section-header"} for b in lb["boxes"])
+            if is_full or is_title:
+                if current_band:
+                    bands.append(current_band)
+                bands.append([lb])
+                current_band = []
+                band_bot = 0.0
+            else:
+                if not current_band:
+                    current_band.append(lb)
+                    band_bot = lb["y2"]
+                elif lb["y1"] <= band_bot + page_h * 0.03:
+                    current_band.append(lb)
+                    band_bot = max(band_bot, lb["y2"])
+                else:
+                    bands.append(current_band)
+                    current_band = [lb]
+                    band_bot = lb["y2"]
+        if current_band:
+            bands.append(current_band)
 
-            # =====================================================================
-
-            if visualize and vis_dir:
-                # Визуализируем сырой глобальный проход (для отладки)
-                annotated_frame = res_1280.plot(pil=True, line_width=2, font_size=12)
-                cv2.imwrite(
-                    os.path.join(vis_dir, f"page_{page_num + 1}.jpg"), annotated_frame
-                )
-
-            # Передаем ансамбль боксов в NMS и далее в сортировщик!
-            filtered_boxes = self._apply_nms(final_boxes)
-            sorted_boxes = self._sort_reading_order(
-                filtered_boxes, pil_img.width, pil_img.height
-            )
-
-            page_plan = {
-                "page_num": page_num + 1,
-                "width_px": pil_img.width,
-                "height_px": pil_img.height,
-                "width_pt": page.rect.width,
-                "height_pt": page.rect.height,
-                "blocks": [],
-            }
-
-            # Хранилище уже вырезанных боксов на этой странице для удаления дубликатов
-            saved_crops_coords = []
-            
-            def is_duplicate(new_coords):
-                for saved in saved_crops_coords:
-                    x_left = max(new_coords[0], saved[0])
-                    y_top = max(new_coords[1], saved[1])
-                    x_right = min(new_coords[2], saved[2])
-                    y_bottom = min(new_coords[3], saved[3])
-                    
-                    if x_right > x_left and y_bottom > y_top:
-                        inter = (x_right - x_left) * (y_bottom - y_top)
-                        area_new = (new_coords[2] - new_coords[0]) * (new_coords[3] - new_coords[1])
-                        area_saved = (saved[2] - saved[0]) * (saved[3] - saved[1])
-                        
-                        # Если пересечение занимает больше 85% от ЛЮБОГО из боксов - это наглый дубликат
-                        if inter / min(area_new, area_saved) > 0.85:
-                            return True
-                return False
-
-            for box in sorted_boxes:
-                coords = [int(c) for c in box.xyxy[0].tolist()]
-                label = self.model.names[int(box.cls[0])].lower()
-
-                if label in self.ignore_classes:
-                    continue
-
-                if self._is_box_empty(coords, gray):
-                    continue
-
-                # удаление цельностраничных кандидатов
-                box_area = (coords[2] - coords[0]) * (coords[3] - coords[1])
-                page_area_px = pil_img.width * pil_img.height
-                
-                if (box_area / page_area_px) > 0.75:
-                    continue  # Игнорируем гигантские боксы (фон или весь лист)
-
-                block = {
-                    "type": label,
-                    "coords": coords,
-                    "track": "DOCLING_TEXT",  # Текст и заголовки
-                    "content_path": None,
-                    "md_image_name": None,
-                }
-
-                if label in self.vlm_candidates:
-                    block["track"] = "PADDLE_OCR"  # VLM
-                elif label == "table":
-                    block["track"] = "DOCLING_TABLE"  # Таблицы
-
-                # Кропы только для OCR и таблиц
-                if block["track"] in ["PADDLE_OCR", "DOCLING_TABLE"]:
-                    prefix = (
-                        "table" if block["track"] == "DOCLING_TABLE" else "candidate"
-                    )
-                    fname = (
-                        f"{prefix}_{global_image_counter}.png"
-                        if prefix == "candidate"
-                        else f"table_p{page_num + 1}_{coords[1]}.png"
-                    )
-                    temp_path = os.path.join(temp_dir, fname)
-
-                    self._crop_image(
-                        pil_img, coords, padding=10 if label == "table" else 0
-                    ).save(temp_path)
-
-                    block["content_path"] = temp_path
-                    if block["track"] == "PADDLE_OCR":
-                        block["md_image_name"] = (
-                            f"doc_{doc_id}_image_{global_image_counter}.png"
-                        )
-                        global_image_counter += 1
-
-                page_plan["blocks"].append(block)
-
-            # Ищем растровые объекты, которые пропустила YOLO
-            physical_images = page.get_image_info(xrefs=True)
-            for img in physical_images:
-                img_rect = fitz.Rect(img["bbox"])
-
-                if img_rect.width < 80 or img_rect.height < 80:
-                    continue
-                
-                # игнор фоновых изображений
-                page_area_pt = page.rect.width * page.rect.height
-                if img_rect.get_area() / page_area_pt > 0.75:
-                    continue
-
-                is_caught_by_yolo = False
-                for box in sorted_boxes:
-                    coords = [int(c) for c in box.xyxy[0].tolist()]
-                    yolo_rect = fitz.Rect(
-                        coords[0] * (PDF_TO_LAYOUT),
-                        coords[1] * (PDF_TO_LAYOUT),
-                        coords[2] * (PDF_TO_LAYOUT),
-                        coords[3] * (PDF_TO_LAYOUT),
-                    )
-                    if (
-                        yolo_rect.intersect(img_rect).get_area()
-                        > img_rect.get_area() * 0.5
-                    ):
-                        is_caught_by_yolo = True
+        # Колонки и финальная распаковка
+        final: list = []
+        for band in bands:
+            columns: list[list[dict]] = []
+            for lb in band:
+                placed = False
+                for col in columns:
+                    col_x1 = min(c["x1"] for c in col)
+                    col_x2 = max(c["x2"] for c in col)
+                    col_w = col_x2 - col_x1
+                    ov = max(0.0, min(lb["x2"], col_x2) - max(lb["x1"], col_x1))
+                    min_w = min(lb["w"], col_w)
+                    if min_w > 0 and ov / min_w > 0.3:
+                        col.append(lb)
+                        placed = True
                         break
+                if not placed:
+                    columns.append([lb])
+            columns.sort(key=lambda col: min(c["x1"] for c in col))
+            for col in columns:
+                col.sort(key=lambda lb: lb["y1"])
+                for lb in col:
+                    for phys in lb["boxes"]:
+                        final.append(phys["box"])
+        return final
 
-                # И заменяем блок добавления пропущенного растра:
-                if not is_caught_by_yolo:
-                    missed_coords = [
-                        int(img_rect.x0 * (LAYOUT_TO_PDF)),
-                        int(img_rect.y0 * (LAYOUT_TO_PDF)),
-                        int(img_rect.x1 * (LAYOUT_TO_PDF)),
-                        int(img_rect.y1 * (LAYOUT_TO_PDF)),
-                    ]
 
-                    missed_coords = [
-                        max(0, missed_coords[0]),
-                        max(0, missed_coords[1]),
-                        min(pil_img.width, missed_coords[2]),
-                        min(pil_img.height, missed_coords[3]),
-                    ]
+# ---------------------------------------------------------------------------
+# Вспомогательные функции
+# ---------------------------------------------------------------------------
 
-                    if (missed_coords[2] <= missed_coords[0] or missed_coords[3] <= missed_coords[1]):
-                        continue
-                        
-                    # убираем дубликаты для растра
-                    if is_duplicate(missed_coords):
-                        continue
 
-                    # Выбрасываем однотонные заливки и квадратные скриншоты:
-                    # они раздувают images/ и ухудшают min(pred,gold)/max(pred,gold).
-                    preview_crop = self._crop_image(pil_img, missed_coords, padding=5)
-                    if self._is_blank_or_screenshot(preview_crop):
-                        continue
+def _ioa(box_small: list, box_large: list) -> float:
+    """Intersection over Area of box_small."""
+    x1 = max(box_small[0], box_large[0])
+    y1 = max(box_small[1], box_large[1])
+    x2 = min(box_small[2], box_large[2])
+    y2 = min(box_small[3], box_large[3])
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    inter = (x2 - x1) * (y2 - y1)
+    small_area = (box_small[2] - box_small[0]) * (box_small[3] - box_small[1])
+    return inter / small_area if small_area > 0 else 0.0
 
-                    saved_crops_coords.append(missed_coords)
 
-                    block = {
-                        "type": "missed_raster",
-                        "coords": missed_coords,
-                        "track": "PADDLE_OCR",
-                        "content_path": None,
-                        "md_image_name": None,
-                    }
+def _is_image_noisy(gray: np.ndarray, threshold: int = 5000) -> bool:
+    """True если страница содержит >threshold точечных артефактов (пыль сканера)."""
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    _, _, stats, _ = cv2.connectedComponentsWithStats(thresh, connectivity=8)
+    areas = stats[:, cv2.CC_STAT_AREA]
+    return int(np.sum((areas[1:] > 0) & (areas[1:] <= 10))) > threshold
 
-                    # НОВОЕ НАЗВАНИЕ ФАЙЛОВ С УКАЗАНИЕМ X и Y
-                    fname = f"candidate_p{page_num + 1}_x{missed_coords[0]}_y{missed_coords[1]}.png"
-                    temp_path = os.path.join(temp_dir, fname)
-                    preview_crop.save(temp_path)
 
-                    block["content_path"] = temp_path
-                    block["md_image_name"] = f"doc_{doc_id}_image_{global_image_counter}.png"
-                    global_image_counter += 1
+def _is_box_empty(coords: list[int], gray: np.ndarray) -> bool:
+    """True если внутри бокса нет реального контента (только фон или пыль)."""
+    x1, y1, x2, y2 = coords
+    m = 5
+    x1c = min(x1 + m, x2); y1c = min(y1 + m, y2)
+    x2c = max(x1, x2 - m); y2c = max(y1, y2 - m)
+    crop = gray[y1c:y2c, x1c:x2c]
+    if crop.size == 0 or crop.shape[0] < 5 or crop.shape[1] < 5:
+        return True
+    _, thresh = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    n, _, stats, _ = cv2.connectedComponentsWithStats(thresh, connectivity=8)
+    if n <= 1:
+        return True
+    return int(np.max(stats[1:, cv2.CC_STAT_AREA])) < 35
 
-                    page_plan["blocks"].append(block)
 
-            routing_plan["pages"].append(page_plan)
+def _find_missed_rasters(
+    page: fitz.Page,
+    pil_img: Image.Image,
+    sorted_boxes: list,
+    saved_coords: list[list[int]],
+    doc_id: str,
+    img_counter: int,
+) -> list[dict]:
+    """Возвращает блоки type='picture' для растровых объектов PDF пропущенных YOLO."""
+    results: list[dict] = []
+    counter = img_counter
+    page_area_pt = page.rect.width * page.rect.height
 
-            if visualize and vis_dir:
-                # Рисуем поверх оригинальной картинки
-                img_draw = img_cv2.copy()
+    for img_info in page.get_image_info(xrefs=True):
+        img_rect = fitz.Rect(img_info["bbox"])
+        if img_rect.width < 50 or img_rect.height < 50:
+            continue
+        if page_area_pt > 0 and img_rect.get_area() / page_area_pt > 0.75:
+            continue
 
-                # Отдельный счетчик для валидных (не игнорируемых) блоков
-                valid_block_counter = 1
+        # Проверяем — поймал ли YOLO этот растр (по IoA > 50%)
+        caught = False
+        for box in sorted_boxes:
+            px = [int(c) for c in box.xyxy[0].tolist()]
+            yolo_rect = fitz.Rect(
+                px[0] * _PX_TO_PT, px[1] * _PX_TO_PT,
+                px[2] * _PX_TO_PT, px[3] * _PX_TO_PT,
+            )
+            if yolo_rect.intersect(img_rect).get_area() > img_rect.get_area() * 0.5:
+                caught = True
+                break
+        if caught:
+            continue
 
-                for box in sorted_boxes:
-                    label = self.model.names[int(box.cls[0])].lower()
+        # PDF points → пиксели LAYOUT
+        mc = [
+            max(0, int(img_rect.x0 * _PT_TO_PX)),
+            max(0, int(img_rect.y0 * _PT_TO_PX)),
+            min(pil_img.width, int(img_rect.x1 * _PT_TO_PX)),
+            min(pil_img.height, int(img_rect.y1 * _PT_TO_PX)),
+        ]
+        if mc[2] <= mc[0] or mc[3] <= mc[1]:
+            continue
+        if _is_duplicate(mc, saved_coords):
+            continue
 
-                    # Пропускаем abandon и все остальные классы из ignore_classes
-                    if label in self.ignore_classes:
-                        continue
+        saved_coords.append(mc)
+        results.append({
+            "type": "picture",
+            "coords": mc,
+            "conf": 1.0,
+            "md_image_name": f"doc_{doc_id}_image_{counter}.png",
+        })
+        counter += 1
 
-                    coords = [int(c) for c in box.xyxy[0].tolist()]
+    return results
 
-                    # Отрисовываем рамку (зеленая)
-                    cv2.rectangle(
-                        img_draw,
-                        (coords[0], coords[1]),
-                        (coords[2], coords[3]),
-                        (0, 255, 0),
-                        2,
-                    )
 
-                    # Рисуем порядковый номер и класс блока (например: "1 (text)")
-                    order_text = f"{valid_block_counter} ({label})"
-                    cv2.putText(
-                        img_draw,
-                        order_text,
-                        (coords[0] + 5, coords[1] + 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8,  # Немного уменьшили шрифт, чтобы влезло название класса
-                        (0, 0, 255),  # Красный цвет (BGR)
-                        2,  # Толщина линии
-                    )
+def _is_duplicate(
+    coords: list[int], saved: list[list[int]], threshold: float = 0.85
+) -> bool:
+    for s in saved:
+        x1 = max(coords[0], s[0]); y1 = max(coords[1], s[1])
+        x2 = min(coords[2], s[2]); y2 = min(coords[3], s[3])
+        if x2 > x1 and y2 > y1:
+            inter = (x2 - x1) * (y2 - y1)
+            a1 = (coords[2] - coords[0]) * (coords[3] - coords[1])
+            a2 = (s[2] - s[0]) * (s[3] - s[1])
+            if min(a1, a2) > 0 and inter / min(a1, a2) > threshold:
+                return True
+    return False
 
-                    valid_block_counter += 1
 
-                cv2.imwrite(
-                    os.path.join(vis_dir, f"page_{page_num + 1}_order.jpg"), img_draw
-                )
+def _visualize(
+    img_cv2: np.ndarray, boxes: list, names: dict, vis_dir: str, page_num: int
+) -> None:
+    draw = img_cv2.copy()
+    for idx, box in enumerate(boxes, 1):
+        label = names[int(box.cls[0])].lower()
+        x1, y1, x2, y2 = [int(c) for c in box.xyxy[0].tolist()]
+        cv2.rectangle(draw, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(
+            draw, f"{idx} ({label})", (x1 + 5, y1 + 30),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2,
+        )
+    cv2.imwrite(os.path.join(vis_dir, f"page_{page_num}_order.jpg"), draw)
 
-        doc.close()
-        return routing_plan
 
+def _doc_id_from_name(stem: str) -> str:
+    """document_051 → '51' (без ведущих нулей)."""
+    m = re.search(r"(\d+)", stem)
+    return str(int(m.group(1))) if m else stem
+
+
+# Экспорт для pipeline.py
+FIGURE_LABELS = _FIGURE_LABELS
+TEXT_LABELS = _TEXT_LABELS
+TABLE_LABELS = _TABLE_LABELS
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="LayoutRouter")
-    parser.add_argument("--pdf", type=str, required=True, help="Путь к PDF")
-    parser.add_argument("--visualize", action="store_true", help="Визуализация")
+    parser = argparse.ArgumentParser(description="LayoutRouter — DocLayout-YOLOv10")
+    parser.add_argument("--pdf", required=True, help="Путь к PDF")
+    parser.add_argument("--output-dir", default="data/output")
+    parser.add_argument("--visualize", action="store_true")
     args = parser.parse_args()
 
     if not os.path.exists(args.pdf):
-        print(f"[ERROR] Файл не найден по пути '{args.pdf}'")
-        exit(1)
+        print(f"[ERROR] Файл не найден: {args.pdf}")
+        raise SystemExit(1)
 
     router = LayoutRouter()
-    plan = router.build_routing_plan(args.pdf, visualize=args.visualize)
+    plan = router.build_routing_plan(args.pdf, args.output_dir, visualize=args.visualize)
     print(json.dumps(plan, indent=2, ensure_ascii=False))
