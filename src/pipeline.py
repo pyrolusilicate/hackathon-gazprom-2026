@@ -333,19 +333,22 @@ class Pipeline:
             if raw and _validate_text(raw, ""):
                 is_table = "<table" in raw.lower() or raw.lstrip().startswith("|")
                 if is_table:
-                    # image_with_table: возвращаем только текст, без PNG и без image ref
+                    # image_with_table: только текст, без PNG и без image ref
                     tbl = _postprocess_vlm_table(raw)
                     result = tbl if tbl else re.sub(r"<[^>]+>", " ", raw).strip()
                     return filter_noise_lines(result, min_chars=3)
-                # Нет таблицы — сохраняем OCR-текст для подписи под картинкой
-                raw = raw[:800]
-                ocr_text = filter_noise_lines(raw, min_chars=3)
+                # Много слов → скан / рукопись / rasterized_pdf: только текст, без PNG
+                cleaned = filter_noise_lines(raw[:800], min_chars=3)
+                if len(cleaned.split()) > 20:
+                    return cleaned
+                # Мало слов → подпись/метка на реальном рисунке: сохраняем OCR-текст
+                ocr_text = cleaned
             else:
                 ocr_text = ""
         else:
             ocr_text = ""
 
-        # Таблицы нет — сохраняем PNG и создаём image ref
+        # Таблицы нет и текст короткий → реальный рисунок, сохраняем PNG и создаём image ref
         dest = os.path.join(self.images_dir, md_image_name)
         try:
             thumb = pil.convert("RGB")
