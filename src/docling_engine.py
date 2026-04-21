@@ -1,10 +1,15 @@
 """
-Docling wrapper: layout + TableFormer + OCR (EasyOCR RU/EN).
+Docling DocumentConverter wrapper.
 
-Основной движок пайплайна. Обрабатывает PDF целиком: detects layout, parses
-text, extracts tables via TableFormer, rasterizes figures, и OCR'ит сканы.
+Docling (IBM) — основной движок Fast Track. Делает всё сразу:
+  * layout-анализ (heron-101)
+  * извлечение текста с сохранением позиций (prov/bbox)
+  * TableFormer для структуры таблиц (state-of-art TEDS)
+  * EasyOCR (ru+en) для сканов
+  * рендер picture-объектов
 
-Singleton по умолчанию — первая инициализация качает модели (~400MB).
+Singleton: первая инициализация подкачивает модели (~400MB), поэтому
+инстанс кэшируется на всё время жизни процесса.
 """
 
 from __future__ import annotations
@@ -16,17 +21,25 @@ from device import is_cuda_available
 
 
 class DoclingEngine:
-    """Singleton-обёртка над Docling DocumentConverter."""
+    """Singleton-обёртка над ``docling.DocumentConverter``."""
 
     _instance: Optional["DoclingEngine"] = None
 
     @classmethod
     def get(cls) -> "DoclingEngine":
+        """Возвращает процесс-глобальный экземпляр, создавая при первом вызове."""
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
 
     def __init__(self):
+        """
+        Конфигурирует DocumentConverter.
+
+        Настройки подобраны под задачу: RU+EN OCR, TableFormer с cell-matching,
+        сохранение картинок как PIL (generate_picture_images), масштаб 2× для
+        читаемых превью.
+        """
         from docling.datamodel.base_models import InputFormat
         from docling.datamodel.pipeline_options import (
             AcceleratorDevice,
@@ -57,20 +70,22 @@ class DoclingEngine:
         self._converter = DocumentConverter(
             format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
         )
-        print(f"  [Docling] ready ({device.value if hasattr(device, 'value') else device})")
+        device_name = device.value if hasattr(device, "value") else device
+        print(f"  [Docling] ready ({device_name})")
 
     def convert(self, pdf_path: str):
-        """Возвращает DoclingDocument — основной payload пайплайна."""
+        """Конвертирует PDF и возвращает ``DoclingDocument`` (со всеми items)."""
         result = self._converter.convert(pdf_path)
         return result.document
 
     @staticmethod
     def page_is_sparse(doc, page_num: int, *, min_chars: int = 30) -> bool:
         """
-        True, если страница пустая/почти пустая — кандидат на olmOCR fallback.
+        Признак «пустой» страницы — кандидата на olmOCR-fallback.
 
-        Считаем только text-items данной страницы; если на ней есть таблица
-        или picture, не считаем sparse (TableFormer/layout уже поработал).
+        Суммируем длину text-items на странице; если на ней есть табличные или
+        picture-элементы, она автоматически не sparse (TableFormer / layout
+        уже извлекли структуру — fallback не нужен).
         """
         try:
             texts = []
@@ -97,7 +112,7 @@ class DoclingEngine:
             return False
 
     def release(self) -> None:
-        """Освобождает VRAM после конвертации (перед загрузкой olmOCR)."""
+        """Освобождает VRAM между документами (до загрузки olmOCR на ту же GPU)."""
         gc.collect()
         try:
             import torch

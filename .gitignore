@@ -1,11 +1,8 @@
 .venv/
-.claude/
 
 data/raw/*
 data/output/*
 data/visualization
 
-.cache
 __pycache__/
-*.pyc
 .DS_Store

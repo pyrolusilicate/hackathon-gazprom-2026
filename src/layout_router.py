@@ -2,26 +2,31 @@
 Layout-роутер: DocLayout-YOLOv10 + детерминированный reading order.
 
 Multi-scale inference (imgsz=1280 + imgsz=2400):
-  - 1280 — надёжные глобальные якоря, широкие таблицы не режутся
-  - 2400 — лупа: разделяет соседние таблицы если покрытие ≥ 95%
+  * 1280 — надёжные глобальные якоря, широкие таблицы не режутся на части.
+  * 2400 — «лупа»: разбивает сросшиеся соседние таблицы, если покрытие ≥95%
+    и ширина/высота субтаблиц ≥94.5%.
 
-IoM NMS с приоритетом класса (title > section-header > table > figure > text).
+NMS по IoM (intersection over min-area) с приоритетом класса:
+``title > section-header > table > figure > text``. Бокс выбрасывается,
+если >70% его площади перекрыто более приоритетным.
 
 Reading order:
-  1. Логические блоки: фигура/таблица + ближайшая подпись → неразрывно.
-  2. Горизонтальные полосы: блоки с пересечением по Y объединяются.
+  1. Логические блоки: медиа (figure/table) + ближайшая подпись склеиваются.
+  2. Полосы: блоки с пересечением по Y (допуск 3% высоты) объединяются.
   3. Колонки внутри полос (horizontal overlap > 30%), слева-направо.
-  4. Внутри колонки — сверху вниз.
+  4. Внутри колонки — сверху-вниз.
 
-Missed rasters: растровые объекты PDF, пропущенные YOLO, добавляются как "picture".
+Также добавляем растровые объекты PDF, которые YOLO пропустил (по
+``page.get_image_info``) — в итоговый план как type=``picture``.
 
-Возвращает:
+Возвращаемая структура:
     {
       "doc_id": "51",
       "pdf_path": "...",
       "pages": [
         {"page_num": 1, "width": 2480, "height": 3508, "blocks": [
-            {"type": "title", "coords": [x1,y1,x2,y2], "conf": 0.93, "md_image_name": null},
+            {"type": "title", "coords": [x1,y1,x2,y2], "conf": 0.93,
+             "md_image_name": null},
             ...
         ]},
         ...
@@ -44,26 +49,31 @@ import numpy as np
 import torch
 from PIL import Image
 
-from config import LAYOUT_DPI, LAYOUT_TO_PDF, PDF_TO_LAYOUT
+from config import LAYOUT_DPI, LAYOUT_TO_PDF, PDF_TO_LAYOUT, WEIGHTS_DIR
 from device import get_torch_device
 
-# PyTorch <2.6 совместимость при загрузке весов
+# PyTorch ≥2.6 делает weights_only=True по умолчанию и ломает загрузку YOLO.
+# Мононакладка: форсим weights_only=False на уровне torch.load.
 _orig_torch_load = torch.load
 torch.load = lambda *a, **kw: _orig_torch_load(*a, **{**kw, "weights_only": False})
 
-# px (LAYOUT_DPI) ↔ pt (72 DPI)
-_PX_TO_PT = PDF_TO_LAYOUT   # пиксели → PDF points
-_PT_TO_PX = LAYOUT_TO_PDF   # PDF points → пиксели
+# Короткие псевдонимы для проекции координат: «точки ↔ пиксели»
+# (имена `_PX_TO_PT` / `_PT_TO_PX` более читаемы в вызовах, чем сырые коэффициенты).
+_PX_TO_PT = PDF_TO_LAYOUT
+_PT_TO_PX = LAYOUT_TO_PDF
 
 _WEIGHTS_FILE = "doclayout_yolo_docstructbench_imgsz1280_2501.pt"
-_WEIGHTS_DIR = "weights"
 
 _FIGURE_LABELS = {"picture", "figure", "image"}
-_TEXT_LABELS = {"text", "plain text", "plain-text", "title", "section-header", "list-item"}
+_TEXT_LABELS = {
+    "text", "plain text", "plain-text", "title", "section-header", "list-item",
+}
 _TABLE_LABELS = {"table", "table_merged", "table_borderless"}
 
+# Что игнорируем на уровне класса — полностью, без попыток обработать.
 _IGNORE_CLASSES = {"page-header", "page-footer", "footnote", "watermark", "abandon"}
 
+# Приоритет классов для NMS: чем выше число, тем больше шансов выжить при коллизии.
 _CLASS_PRIORITY = {
     "title": 10,
     "section-header": 9,
@@ -87,12 +97,24 @@ _CLASS_PRIORITY = {
 
 
 class LayoutRouter:
-    def __init__(self, weights_dir: str = _WEIGHTS_DIR):
+    """
+    DocLayout-YOLOv10 + reading-order постобработка.
+
+    Одна публичная точка входа — ``build_routing_plan``. Модель подгружается
+    лениво при первом вызове (~400MB весов) и кэшируется в инстансе.
+    """
+
+    def __init__(self, weights_dir: str = WEIGHTS_DIR):
+        """
+        Args:
+            weights_dir: куда скачивать веса YOLO, если их нет локально.
+        """
         self.weights_dir = weights_dir
         self.device = get_torch_device()
         self._model = None
 
     def _load(self) -> None:
+        """Лениво грузит DocLayout-YOLOv10 (скачивает из HF при отсутствии)."""
         if self._model is not None:
             return
         from doclayout_yolo import YOLOv10
@@ -114,6 +136,18 @@ class LayoutRouter:
     def build_routing_plan(
         self, pdf_path: str, output_dir: str, visualize: bool = False
     ) -> dict:
+        """
+        Строит план обработки документа: per-page список блоков с reading order.
+
+        Args:
+            pdf_path: путь к PDF.
+            output_dir: база для вспомогательных файлов (визуализации и пр.).
+            visualize: если True, пишет в ``data/visualization/document_<id>/``
+                аннотированные PNG-страницы с индексами блоков.
+
+        Returns:
+            dict со структурой, описанной в module-docstring.
+        """
         self._load()
         doc_name = Path(pdf_path).stem
         doc_id = _doc_id_from_name(doc_name)
@@ -129,7 +163,6 @@ class LayoutRouter:
             for page_idx, page in enumerate(pdf_doc):
                 page_num_1 = page_idx + 1
 
-                # Рендер на LAYOUT_DPI
                 scale = LAYOUT_DPI / 72.0
                 pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
                 img_rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
@@ -143,16 +176,20 @@ class LayoutRouter:
 
                 gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
 
-                # Шумоподавление
-                img_ready = cv2.medianBlur(img_cv2, 3) if _is_image_noisy(gray) else img_cv2
+                # Шумоподавление только если страница реально «пыльная»:
+                # median blur на чистой странице смазывает мелкий текст.
+                img_ready = (
+                    cv2.medianBlur(img_cv2, 3) if _is_image_noisy(gray) else img_cv2
+                )
 
-                # Multi-scale inference + IoM NMS + reading order
                 raw_boxes = self._multi_scale_predict(img_ready)
                 nms_boxes = self._apply_nms(raw_boxes)
                 sorted_boxes = self._sort_reading_order(nms_boxes, page_w, page_h)
 
                 if visualize and vis_dir:
-                    _visualize(img_cv2, sorted_boxes, self._model.names, vis_dir, page_num_1)
+                    _visualize(
+                        img_cv2, sorted_boxes, self._model.names, vis_dir, page_num_1
+                    )
 
                 blocks: list[dict] = []
                 saved_coords: list[list[int]] = []
@@ -165,16 +202,18 @@ class LayoutRouter:
                         continue
                     if _is_box_empty(coords, gray):
                         continue
-                    # Игнорируем цельностраничные блоки (фон/весь лист)
+                    # Цельностраничные боксы — шум (фон / граница).
                     box_area = (coords[2] - coords[0]) * (coords[3] - coords[1])
                     if box_area / (page_w * page_h) > 0.75:
                         continue
 
                     md_image_name: Optional[str] = None
                     if label in _FIGURE_LABELS:
-                        md_image_name = "__figure__"  # имя назначит pipeline при реальном сохранении
-                    # Все блоки попадают в saved_coords, чтобы _find_missed_rasters
-                    # не добавлял растр поверх уже покрытой таблицей/текстом области
+                        # Реальное имя присваивается в pipeline после проверки,
+                        # что картинка не шумная и стоит её сохранять.
+                        md_image_name = "__figure__"
+                    # saved_coords нужен, чтобы _find_missed_rasters не добавил
+                    # растр поверх уже покрытой таблицей/текстом области.
                     saved_coords.append(coords)
 
                     blocks.append({
@@ -184,7 +223,6 @@ class LayoutRouter:
                         "md_image_name": md_image_name,
                     })
 
-                # Растровые объекты пропущенные YOLO
                 missed = _find_missed_rasters(
                     page, pil_img, sorted_boxes, saved_coords
                 )
@@ -206,9 +244,11 @@ class LayoutRouter:
 
     def _multi_scale_predict(self, img: np.ndarray) -> list:
         """
-        Двухпроходный ансамбль.
-        Если 2400-лупа нашла ≥2 субтаблиц внутри 1280-таблицы с покрытием ≥95%
-        и шириной >94.5% — берём субтаблицы. Иначе доверяем 1280.
+        Двухпроходный YOLO-ансамбль (imgsz=1280 + imgsz=2400).
+
+        Если 2400-лупа нашла ≥2 субтаблиц внутри 1280-таблицы и суммарно они
+        покрывают ≥95% по одной оси с ≥94.5% по другой — это сросшиеся соседние
+        таблицы, берём субтаблицы. Иначе доверяем 1280-якорю.
         """
         res_1280 = self._model.predict(
             img, imgsz=1280, conf=0.165, device=self.device, verbose=False
@@ -247,20 +287,32 @@ class LayoutRouter:
             if len(internal) >= 2:
                 h = coords[3] - coords[1]
                 w = coords[2] - coords[0]
-                cov = sum(
+                sub_h = [
                     parsed_2400[i]["coords"][3] - parsed_2400[i]["coords"][1]
                     for i in internal
-                )
-                min_w = min(
+                ]
+                sub_w = [
                     parsed_2400[i]["coords"][2] - parsed_2400[i]["coords"][0]
                     for i in internal
+                ]
+                # Вертикальный сплит (таблицы стопкой): Σ высот ≥95%, каждая ≥94.5% ширины.
+                vert_ok = (
+                    h > 0
+                    and sum(sub_h) / h >= 0.95
+                    and (w == 0 or min(sub_w) / w > 0.945)
                 )
-                if h > 0 and cov / h >= 0.95 and (w == 0 or min_w / w > 0.945):
+                # Горизонтальный сплит (таблицы рядом): симметрично по осям.
+                horiz_ok = (
+                    w > 0
+                    and sum(sub_w) / w >= 0.95
+                    and (h == 0 or min(sub_h) / h > 0.945)
+                )
+                if vert_ok or horiz_ok:
                     for i in internal:
                         final.append(parsed_2400[i]["box"])
                         used_2400.add(i)
                     continue
-                # Лупа дала неполное покрытие → доверяем 1280
+                # Лупа дала неполное покрытие → доверяем якорю 1280.
                 for i in internal:
                     used_2400.add(i)
             else:
@@ -269,7 +321,7 @@ class LayoutRouter:
 
             final.append(b)
 
-        # Независимые 2400-боксы (не поглощённые 1280-якорями)
+        # Независимые 2400-боксы (не поглощённые никаким 1280-якорем).
         for i, p in enumerate(parsed_2400):
             if i not in used_2400:
                 final.append(p["box"])
@@ -279,14 +331,19 @@ class LayoutRouter:
     # ---- NMS -------------------------------------------------------------
 
     def _apply_nms(self, boxes: list, iom_threshold: float = 0.7) -> list:
-        """IoM NMS: удаляем бокс если >iom_threshold его площади перекрыто более приоритетным."""
+        """
+        NMS по IoM с приоритетом класса.
+
+        Бокс удаляется, если >``iom_threshold`` его площади перекрыто боксом
+        более высокого приоритета. Приоритет figure с низкой уверенностью
+        принудительно занижаем, чтобы он не «съедал» текстовый блок поверх.
+        """
         if not boxes:
             return []
 
         def _priority(b) -> tuple[int, float]:
             cls = self._model.names[int(b.cls[0])].lower()
             p = _CLASS_PRIORITY.get(cls, 3)
-            # Штраф: низко-уверенные figure не должны убивать текстовые блоки
             if cls in _FIGURE_LABELS and float(b.conf[0]) < 0.4:
                 p = 2
             return p, float(b.conf[0])
@@ -318,10 +375,14 @@ class LayoutRouter:
 
     def _sort_reading_order(self, boxes: list, page_w: int, page_h: int) -> list:
         """
-        Band-based reading order:
-          1. Логические блоки: медиа + подпись склеиваются.
-          2. Полосы: блоки с пересечением Y (допуск 3%) объединяются.
-          3. Колонки внутри полос (overlap > 30%), слева-направо, внутри — по Y.
+        Band-based reading order для мульти-колоночных макетов.
+
+        Пайплайн сортировки:
+          1. Логические блоки: медиа + ближайшая подпись склеиваются в один.
+          2. Полосы (bands): блоки с пересечением по Y (допуск 3% высоты
+             страницы) объединяются в горизонтальные группы.
+          3. Колонки внутри полос (overlap > 30% по X), слева-направо.
+          4. Внутри колонки — сверху-вниз.
         """
         if not boxes:
             return []
@@ -488,7 +549,14 @@ def _find_missed_rasters(
     sorted_boxes: list,
     saved_coords: list[list[int]],
 ) -> list[dict]:
-    """Возвращает блоки type='picture' для растровых объектов PDF пропущенных YOLO."""
+    """
+    Находит растровые объекты PDF, которые YOLO пропустил.
+
+    YOLO иногда не детектит мелкие/низкоконтрастные картинки в цифровом PDF;
+    PyMuPDF даёт их напрямую через ``page.get_image_info``. Мы добавляем
+    только те, что НЕ поймал YOLO (IoA с существующим YOLO-боксом ≤50%)
+    и которые не дублируют уже сохранённые координаты.
+    """
     results: list[dict] = []
     page_area_pt = page.rect.width * page.rect.height
 
@@ -499,7 +567,6 @@ def _find_missed_rasters(
         if page_area_pt > 0 and img_rect.get_area() / page_area_pt > 0.75:
             continue
 
-        # Проверяем — поймал ли YOLO этот растр (по IoA > 50%)
         caught = False
         for box in sorted_boxes:
             px = [int(c) for c in box.xyxy[0].tolist()]
@@ -513,7 +580,6 @@ def _find_missed_rasters(
         if caught:
             continue
 
-        # PDF points → пиксели LAYOUT
         mc = [
             max(0, int(img_rect.x0 * _PT_TO_PX)),
             max(0, int(img_rect.y0 * _PT_TO_PX)),
@@ -530,7 +596,7 @@ def _find_missed_rasters(
             "type": "picture",
             "coords": mc,
             "conf": 1.0,
-            "md_image_name": "__figure__",  # имя назначит pipeline при реальном сохранении
+            "md_image_name": "__figure__",
         })
 
     return results
@@ -539,6 +605,7 @@ def _find_missed_rasters(
 def _is_duplicate(
     coords: list[int], saved: list[list[int]], threshold: float = 0.85
 ) -> bool:
+    """True, если ``coords`` сильно пересекается (IoM > threshold) с уже сохранённым."""
     for s in saved:
         x1 = max(coords[0], s[0]); y1 = max(coords[1], s[1])
         x2 = min(coords[2], s[2]); y2 = min(coords[3], s[3])
@@ -554,6 +621,7 @@ def _is_duplicate(
 def _visualize(
     img_cv2: np.ndarray, boxes: list, names: dict, vis_dir: str, page_num: int
 ) -> None:
+    """Сохраняет аннотированную страницу (bbox'ы + индекс + класс) для дебага."""
     draw = img_cv2.copy()
     for idx, box in enumerate(boxes, 1):
         label = names[int(box.cls[0])].lower()

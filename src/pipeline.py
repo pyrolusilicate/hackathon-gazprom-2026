@@ -1,24 +1,30 @@
 """
-Главный пайплайн: PDF → Markdown + images/ → submission.zip
+Главный пайплайн: PDF → Markdown + images/ → submission.zip.
 
-Архитектура (гибрид):
-    Router    : DocLayout-YOLOv10 (layout_router.py) — всегда.
-                Определяет bbox блоков, фильтрует вотермарки/колонтитулы/blank,
-                задаёт reading order (топо-сорт по колонкам).
-    Fast Track: Docling DocumentConverter — один convert(pdf) на документ.
-                Текст и таблицы, сопоставляются с YOLO-блоками по IoM > 0.6.
-    Fallback  : olmOCR-2-7B-1025 BF16 — crop YOLO-блока → markdown,
-                только если Docling вернул пусто/битое.
+Гибридная архитектура из трёх движков:
 
-Треки YOLO → обработка:
-    title/section-header/list-item/text  → Docling text items (IoM-матч)
-    table                                → Docling TableItem + format_table_markdown
-    picture/figure/image                 → PNG + olmOCR OCR-текст
+  Router     : DocLayout-YOLOv10 (layout_router.py).
+               Определяет bbox блоков, отбрасывает вотермарки/колонтитулы/пустые
+               места, задаёт reading order (band → columns → top-down).
 
-Использование:
-    python src/pipeline.py --all
-    python src/pipeline.py --pdf data/raw/document_001.pdf
-    python src/pipeline.py --all --no-vlm         # только YOLO + Docling
+  Fast Track : Docling DocumentConverter — один convert(pdf) на документ.
+               Отдаёт текст и таблицы; сопоставляем с YOLO-блоками по IoM,
+               форматирование берём из реальных типов Docling-элементов
+               (SectionHeaderItem, ListItem, TableItem и т.д.).
+
+  Fallback   : olmOCR-2-7B-1025 BF16 (Qwen2.5-VL) — crop YOLO-блока → markdown.
+               Срабатывает, если Docling не выдал контент (пустой OCR на скане,
+               битый текстовый слой, figure с встроенным текстом).
+
+Маппинг YOLO-класса → обработчик:
+  title/section-header/list-item/text  → _process_text
+  table                                → _process_table
+  picture/figure/image                 → _process_figure (OCR + PNG)
+
+Использование (CLI):
+  python src/pipeline.py --all
+  python src/pipeline.py --pdf data/raw/document_001.pdf
+  python src/pipeline.py --all --no-vlm        # Docling-only, без olmOCR
 """
 
 from __future__ import annotations
@@ -37,6 +43,13 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from config import (
+    IMAGE_MAX_SIDE,
+    IOM_MATCH_THRESHOLD,
+    MAX_AREA_RATIO,
+    OLM_RENDER_SIDE,
+    OUTPUT_DIR,
+)
 from content_extractor import (
     crop_pdf_bbox,
     cyrillic_ratio,
@@ -52,13 +65,8 @@ from layout_router import FIGURE_LABELS, TABLE_LABELS, LayoutRouter
 
 setup_environment()
 
-OUTPUT_DIR = "data/output"
-IMAGE_MAX_SIDE = 150     # финальное сжатие сохранённых картинок
-OLM_RENDER_SIDE = 1288   # olmOCR требует длинную сторону == 1288
 
-IOM_MATCH_THRESHOLD = 0.6   # порог IoM для матчинга Docling-item ↔ YOLO-block
-
-# Водяные знаки которые могут просочиться через YOLO-фильтр
+# Водяные знаки, которые YOLO-классификатор иногда не отбрасывает как abandon.
 _WM_ONLY_RE = re.compile(
     r"^(ЧЕРНОВИК|DRAFT|CONFIDENTIAL|КОНФИДЕНЦИАЛЬНО|НЕ\s+ДЛЯ\s+РАСПРОСТРАНЕНИЯ)\s*$",
     re.I | re.UNICODE,
@@ -68,8 +76,11 @@ _WM_PREFIX_RE = re.compile(
     re.I | re.UNICODE,
 )
 
-# Docling внутренние ссылки на изображения (page_0_0_1280_960.png) — не наш формат
-_DOCLING_IMG_REF_RE = re.compile(r"!\[[^\]]*\]\(page_\d+[^\)]*\.(?:png|jpg|jpeg)\)", re.I)
+# Внутренние Docling-ссылки на изображения (page_0_0_1280_960.png) нужно убирать
+# — наш экспорт использует собственные имена doc_<id>_image_<N>.png.
+_DOCLING_IMG_REF_RE = re.compile(
+    r"!\[[^\]]*\]\(page_\d+[^\)]*\.(?:png|jpg|jpeg)\)", re.I
+)
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +89,20 @@ _DOCLING_IMG_REF_RE = re.compile(r"!\[[^\]]*\]\(page_\d+[^\)]*\.(?:png|jpg|jpeg)
 
 
 class Pipeline:
+    """
+    Оркестратор PDF → Markdown.
+
+    Запускает YOLO-роутер, вызывает Docling и (опционально) olmOCR, собирает
+    markdown и сохраняет картинки. Один экземпляр может обработать много
+    документов подряд — движки закэшированы как singletons и не перезагружаются.
+    """
+
     def __init__(self, output_dir: str = OUTPUT_DIR, use_vlm: bool = True):
+        """
+        Args:
+            output_dir: директория для .md и images/, создаётся при отсутствии.
+            use_vlm: инициализировать olmOCR fallback. На Mac/CPU ставь False.
+        """
         self.output_dir = output_dir
         self.use_vlm = use_vlm
 
@@ -105,23 +129,30 @@ class Pipeline:
     # ------------------------------------------------------------------
 
     def process_pdf(self, pdf_path: str) -> str:
+        """
+        Обрабатывает один PDF и пишет ``<stem>.md`` в ``self.output_dir``.
+
+        Пайплайн: YOLO routing → Docling convert → per-block match/fallback →
+        склейка cross-page таблиц → rule-based post-processing.
+
+        Returns:
+            Абсолютный путь к созданному .md файлу.
+        """
         doc_name = Path(pdf_path).stem
-        doc_id = _doc_id_from_name(doc_name)  # без ведущих нулей
+        doc_id = _doc_id_from_name(doc_name)
 
-        # 1. YOLO routing
         plan = self.router.build_routing_plan(pdf_path, self.output_dir)
-
-        # 2. Docling один проход (Fast Track)
         docling_doc = self.docling.convert(pdf_path)
-
-        # 3. Индекс Docling-items в пиксельных координатах YOLO-растра
         docling_idx = _build_docling_index(docling_doc)
 
-        # 4. Per-block: IoM-матч с Docling, fallback на olmOCR
         pdf_doc = fitz.open(pdf_path)
-        self._doc_img_counter = 0   # счётчик реально сохранённых PNG для этого документа
-        self._used_item_ids: set[int] = set()  # Docling-элементы уже использованные в этом документе
-        flat: list[tuple[str, str, int]] = []  # (yolo_type, md, page_num)
+        # Счётчик реально сохранённых PNG для doc_<id>_image_<N>.png.
+        self._doc_img_counter = 0
+        # Docling-элементы, уже использованные в этом документе: защита от
+        # повторного попадания одного абзаца в два YOLO-блока.
+        self._used_item_ids: set[int] = set()
+        # (yolo_type, markdown, page_num) — плоский поток перед склейкой.
+        flat: list[tuple[str, str, int]] = []
 
         try:
             for page_data in plan["pages"]:
@@ -137,7 +168,6 @@ class Pipeline:
                     if md and md.strip():
                         flat.append((block["type"], md.strip(), page_num_1))
 
-                # Освобождаем VRAM между страницами
                 gc.collect()
                 try:
                     import torch
@@ -148,13 +178,9 @@ class Pipeline:
         finally:
             pdf_doc.close()
 
-        # 4.5. Удаляем PNG и ссылки для figure-блоков без Рис. после них (шум/мусор)
         flat = _drop_figures_without_caption(flat, self.images_dir)
-
-        # 5. Склейка таблиц через разрыв страницы
         parts = _merge_cross_page_tables(flat)
 
-        # 6. Сборка и пост-обработка
         markdown = _postprocess_document("\n\n".join(parts))
         md_path = os.path.join(self.output_dir, f"{doc_name}.md")
         Path(md_path).write_text(markdown, encoding="utf-8")
@@ -162,6 +188,15 @@ class Pipeline:
         return md_path
 
     def process_all(self, raw_dir: str = "data/raw") -> str:
+        """
+        Обрабатывает все ``document_*.pdf`` из ``raw_dir`` и пакует результат.
+
+        Ошибки одного документа не прерывают работу — логируются и пропускаются,
+        чтобы на 100 PDF один битый файл не ломал весь прогон.
+
+        Returns:
+            Путь к ``submission.zip``.
+        """
         pdfs = sorted(Path(raw_dir).glob("document_*.pdf"))
         print(f"Найдено {len(pdfs)} PDF файлов")
         for i, pdf_path in enumerate(pdfs, 1):
@@ -186,13 +221,13 @@ class Pipeline:
         page_items: list,
         doc_id: str,
     ) -> str:
+        """Маршрутизация YOLO-блока в соответствующий handler по его типу."""
         btype = block["type"]
 
         if btype in FIGURE_LABELS:
             return self._process_figure(block, page_num_0, pdf_doc, doc_id)
         if btype in TABLE_LABELS:
             return self._process_table(block, page_num_0, pdf_doc, page_items)
-        # текстовый (title/section-header/list-item/text/plain-text)
         return self._process_text(block, page_num_0, pdf_doc, page_items)
 
     # ---- текстовые блоки ----------------------------------------------
@@ -204,19 +239,27 @@ class Pipeline:
         pdf_doc: fitz.Document,
         page_items: list,
     ) -> str:
+        """
+        Обработка текстового YOLO-блока (title / section-header / list-item / text).
+
+        1. Fast Track: матчинг с Docling-text-items по IoM; форматирование
+           берётся из реального Docling-типа (SectionHeaderItem.level, ListItem).
+        2. Fallback: если Docling-матчей нет, рендерим crop и гоним olmOCR.
+        3. Markdown: приоритет форматирования — Docling-тип → YOLO-btype →
+           эвристика по первой строке.
+        """
         coords = block["coords"]
         btype = block["type"]
 
-        # 1. Docling Fast Track: собираем тексты и инферим форматирование из типов Docling
         matched = _match_items_by_iom(coords, page_items, kind_filter=("text",))
         text_parts = []
-        docling_heading_level: int = 0   # уровень из SectionHeaderItem.level
-        docling_is_list: bool = False    # хотя бы один ListItem среди матчей
+        docling_heading_level: int = 0
+        docling_is_list: bool = False
 
         for _, _, item in matched:
             item_id = id(item)
             if item_id in self._used_item_ids:
-                continue  # этот Docling-элемент уже использован другим YOLO-блоком
+                continue
             t = getattr(item, "text", "") or ""
             t = _DOCLING_IMG_REF_RE.sub("", t).strip()
             if not t:
@@ -224,19 +267,21 @@ class Pipeline:
             self._used_item_ids.add(item_id)
             text_parts.append(t)
 
-            # Читаем реальный тип Docling-элемента (первый матч определяет форматирование)
+            # Форматирование определяет ПЕРВЫЙ непустой матч — он же и самый
+            # крупный по IoM (matches отсортированы по score).
             if docling_heading_level == 0 and not docling_is_list:
                 itype = type(item).__name__
                 if itype == "SectionHeaderItem":
                     lvl = getattr(item, "level", None)
-                    docling_heading_level = int(lvl) if isinstance(lvl, int) and 1 <= lvl <= 6 else 2
+                    docling_heading_level = (
+                        int(lvl) if isinstance(lvl, int) and 1 <= lvl <= 6 else 2
+                    )
                 elif itype == "ListItem":
                     docling_is_list = True
 
         text = "\n".join(text_parts)
         text = filter_noise_lines(text, min_chars=3)
 
-        # 2. Docling пусто → olmOCR crop
         if not text and self.olm is not None:
             img = crop_pdf_bbox(pdf_doc, page_num_0, coords, max_side=OLM_RENDER_SIDE)
             if img is not None:
@@ -251,28 +296,26 @@ class Pipeline:
         if not text:
             return ""
 
-        # 3. Markdown-форматирование
-        # Приоритет: реальный тип Docling → YOLO btype → эвристика по тексту
         heading_level = 0
 
         if btype == "title":
-            heading_level = 1
+            first_line = text.splitlines()[0].strip() if text.strip() else ""
+            # Пронумерованный пункт («1. Введение») — подраздел ####, а не ###.
+            heading_level = 4 if re.match(r"^\d+[\d\.]*\s", first_line) else 3
         elif docling_heading_level:
-            # Docling знает иерархию документа — доверяем ему
             heading_level = docling_heading_level
         elif btype == "section-header":
-            # Docling не вернул SectionHeaderItem → эвристика по тексту
             first_line = text.splitlines()[0].strip() if text.strip() else ""
-            if re.match(r"^\d+[\d\.]*\s", first_line):
-                heading_level = 4  # пронумерованный пункт → ####
-            else:
-                heading_level = 3  # Глава / Раздел → ###
+            heading_level = 4 if re.match(r"^\d+[\d\.]*\s", first_line) else 3
 
         if heading_level > 0:
-            # Если bbox захватил заголовок + тело — разделяем
+            # Иногда YOLO-bbox захватывает и заголовок, и первый абзац тела —
+            # разделяем их на два markdown-блока.
             lines = [l.strip() for l in text.splitlines() if l.strip()]
             if len(lines) > 1:
-                heading_md = format_text_markdown(lines[0], "section-header", heading_level)
+                heading_md = format_text_markdown(
+                    lines[0], "section-header", heading_level
+                )
                 body_text = _as_list_if_needed(lines[1:]) or "\n".join(lines[1:])
                 return f"{heading_md}\n\n{body_text}"
             return format_text_markdown(text, "section-header", heading_level)
@@ -280,8 +323,9 @@ class Pipeline:
         if docling_is_list or btype == "list-item":
             return format_text_markdown(text, "list-item", 0)
 
-        # Обычный текст: пробуем определить список по содержимому
-        return _as_list_if_needed(text.splitlines()) or format_text_markdown(text, btype, 0)
+        return _as_list_if_needed(text.splitlines()) or format_text_markdown(
+            text, btype, 0
+        )
 
     # ---- таблицы ------------------------------------------------------
 
@@ -292,12 +336,17 @@ class Pipeline:
         pdf_doc: fitz.Document,
         page_items: list,
     ) -> str:
+        """
+        Обработка YOLO-table: TableFormer (Docling) → pipe-markdown; иначе olmOCR.
+
+        Используется только лучший Docling-матч по IoM, остальные не пробуются —
+        в 99% случаев top-match и есть таблица, а попытки fallback-матчей дают
+        дубли / артефакты.
+        """
         coords = block["coords"]
 
-        # 1. Docling TableFormer: матчим по IoM
         matched = _match_items_by_iom(coords, page_items, kind_filter=("table",))
         if matched:
-            # Берём первую не-использованную таблицу с лучшим IoM
             for _, _, tbl_item in matched:
                 tbl_id = id(tbl_item)
                 if tbl_id in self._used_item_ids:
@@ -308,9 +357,8 @@ class Pipeline:
                     md = format_table_markdown(grid)
                     if md and _validate_table(md, ""):
                         return md
-                break  # попробовали лучший матч — дальше не идём
+                break
 
-        # 2. Fallback: olmOCR crop
         if self.olm is not None:
             img = crop_pdf_bbox(pdf_doc, page_num_0, coords, max_side=OLM_RENDER_SIDE)
             if img is not None:
@@ -322,7 +370,8 @@ class Pipeline:
                 md = _postprocess_vlm_table(raw)
                 if md and _validate_table(md, ""):
                     return md
-                # olmOCR вернул текст без табличной структуры — только если нет HTML
+                # VLM вернул текст без табличной структуры — принимаем как
+                # текстовый абзац, но только если нет обрезанного HTML.
                 if raw and _validate_text(raw, "") and "<" not in raw:
                     return filter_noise_lines(raw, min_chars=3)
 
@@ -337,17 +386,26 @@ class Pipeline:
         pdf_doc: fitz.Document,
         doc_id: str,
     ) -> str:
+        """
+        Обработка figure/picture/image-блока.
+
+        Логика ветвится по содержимому:
+          * почти-белый crop (>98%) → шум сканера, пропуск;
+          * olmOCR распознал таблицу → только text/markdown, PNG не сохраняем;
+          * olmOCR распознал много текста (>20 слов) → это скан страницы,
+            сохраняем только текст;
+          * иначе → сохраняем PNG (с опциональным OCR-подписью внизу).
+        """
         coords = block["coords"]
-        # md_image_name от роутера — всегда "__figure__" (имя назначается ниже при сохранении)
         if not block.get("md_image_name"):
             return ""
 
-        # Рендерим bbox в PIL для OCR и (возможно) сохранения
-        pil = crop_pdf_bbox(pdf_doc, page_num_0, coords, max_side=OLM_RENDER_SIDE, pad_pts=0.0)
+        pil = crop_pdf_bbox(
+            pdf_doc, page_num_0, coords, max_side=OLM_RENDER_SIDE, pad_pts=0.0
+        )
         if pil is None:
             return ""
 
-        # Шумовое изображение (чёрные точки / пыль): почти полностью белое → пропускаем
         _white_ratio = 0.0
         try:
             import numpy as np
@@ -358,7 +416,6 @@ class Pipeline:
         except Exception:
             pass
 
-        # Сначала olmOCR — определяем тип контента
         if self.olm is not None:
             try:
                 raw = self.olm.page_to_markdown(pil).strip()
@@ -368,26 +425,23 @@ class Pipeline:
             if raw and _validate_text(raw, ""):
                 is_table = "<table" in raw.lower() or raw.lstrip().startswith("|")
                 if is_table:
-                    # image_with_table: только текст, без PNG и без image ref
                     tbl = _postprocess_vlm_table(raw)
                     result = tbl if tbl else re.sub(r"<[^>]+>", " ", raw).strip()
                     return filter_noise_lines(result, min_chars=3)
-                # Много слов → скан / рукопись / rasterized_pdf: только текст, без PNG
                 cleaned = filter_noise_lines(raw[:800], min_chars=3)
                 if len(cleaned.split()) > 20:
                     return cleaned
-                # Мало слов → подпись на реальном рисунке
                 ocr_text = cleaned
             else:
                 ocr_text = ""
         else:
             ocr_text = ""
 
-        # Пост-проверка: нет контента + преимущественно белое → шум, пропускаем
         if not ocr_text and _white_ratio > 0.95:
             return ""
 
-        # Реальный рисунок: назначаем имя только сейчас (счётчик по реально сохранённым PNG)
+        # Имя присваиваем только сейчас: счётчик считает РЕАЛЬНО сохранённые PNG,
+        # а не все YOLO-figure блоки (многие из них окажутся шумом / скан-текстом).
         self._doc_img_counter += 1
         md_image_name = f"doc_{doc_id}_image_{self._doc_img_counter}.png"
         dest = os.path.join(self.images_dir, md_image_name)
@@ -397,14 +451,12 @@ class Pipeline:
             thumb.save(dest, "PNG", optimize=True, compress_level=9)
         except Exception as exc:  # noqa: BLE001
             print(f"  [WARN] save figure: {exc}")
-            self._doc_img_counter -= 1  # откатываем счётчик — PNG не сохранился
+            self._doc_img_counter -= 1
             return ""
 
-        # alt = "text" если есть OCR, "image" если просто картинка
         alt = "text" if ocr_text else "image"
         image_md = f"![{alt}](images/{md_image_name})"
         if ocr_text:
-            # Двойной перенос: Рис. caption (следующий блок) встанет между image_ref и OCR текстом
             return f"{image_md}\n\n{ocr_text}"
         return image_md
 
@@ -413,6 +465,7 @@ class Pipeline:
     # ------------------------------------------------------------------
 
     def _create_zip(self) -> str:
+        """Пакует все ``document_*.md`` + ``images/*.png`` в ``submission.zip``."""
         zip_path = os.path.join(self.output_dir, "submission.zip")
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for md_file in sorted(Path(self.output_dir).glob("document_*.md")):
@@ -431,9 +484,15 @@ class Pipeline:
 
 def _build_docling_index(doc) -> dict[int, list[tuple]]:
     """
-    Строит {page_num_1based: [(bbox_px, kind, item), ...]}.
-    bbox_px — в пикселях YOLO-растра (LAYOUT_DPI), top-left origin.
-    kind ∈ {'text', 'table', 'picture'}.
+    Строит индекс Docling-элементов по страницам в координатах YOLO-растра.
+
+    Returns:
+        ``{page_num_1based: [(bbox_px, kind, item), ...]}``, где ``bbox_px``
+        — кортеж ``(x1, y1, x2, y2)`` в пикселях LAYOUT_DPI с top-left origin,
+        а ``kind ∈ {'text', 'table', 'picture'}``.
+
+    Docling отдаёт bbox в PDF points с разным origin (TOPLEFT / BOTTOMLEFT);
+    нормализуем к единой системе через ``points_to_pixels``.
     """
     index: dict[int, list[tuple]] = {}
 
@@ -497,9 +556,6 @@ def _build_docling_index(doc) -> dict[int, list[tuple]]:
     return index
 
 
-_MAX_AREA_RATIO = 8.0  # Docling-item не должен быть > 8× больше YOLO-блока
-
-
 def _match_items_by_iom(
     block_bbox_px: list,
     page_items: list,
@@ -508,12 +564,15 @@ def _match_items_by_iom(
     threshold: float = IOM_MATCH_THRESHOLD,
 ) -> list[tuple[float, str, object]]:
     """
-    Возвращает [(iom_score, kind, item), ...] отсортированный по убыванию IoM,
-    только элементы с IoM ≥ threshold и нужным kind.
+    Сопоставляет YOLO-блок с Docling-items одной страницы по IoM.
 
-    Дополнительная защита: если Docling-item bbox > MAX_AREA_RATIO × YOLO-bbox,
-    это page-level / whole-section элемент — пропускаем (иначе один огромный item
-    склеивает весь текст страницы и дублируется через _used_item_ids на первый блок).
+    Возвращает список ``(iom_score, kind, item)``, отсортированный по убыванию
+    IoM; только элементы с IoM ≥ ``threshold`` и нужным ``kind``.
+
+    Отсекаем Docling-items, у которых bbox > ``MAX_AREA_RATIO × YOLO-bbox``:
+    это «whole-section» элементы (страница целиком, раздел), и без фильтра они
+    склеивают весь текст в первый попавшийся YOLO-блок, блокируя остальные
+    через ``_used_item_ids``.
     """
     x1a, y1a, x2a, y2a = block_bbox_px[:4]
     yolo_area = max(1.0, (x2a - x1a) * (y2a - y1a))
@@ -524,8 +583,8 @@ def _match_items_by_iom(
             continue
         x1b, y1b, x2b, y2b = bbox_b[:4]
         docling_area = max(1.0, (x2b - x1b) * (y2b - y1b))
-        if docling_area / yolo_area > _MAX_AREA_RATIO:
-            continue  # Docling-item на порядок больше YOLO-блока — не наш матч
+        if docling_area / yolo_area > MAX_AREA_RATIO:
+            continue
         score = iom(tuple(block_bbox_px), bbox_b)
         if score >= threshold:
             matches.append((score, kind, item))
@@ -578,6 +637,7 @@ _HTML_TABLE_RE = re.compile(r"<table[^>]*>.*?</table>", re.S | re.I)
 
 
 def _parse_html_table(html: str) -> tuple[list[list[str]], int]:
+    """Парсит ``<table>`` → (rows, n_header_rows); хедером считается префикс <th>-строк."""
     rows: list[list[str]] = []
     n_header_rows = 0
     for tr in _TR_RE.finditer(html):
@@ -674,6 +734,12 @@ def _postprocess_vlm_table(md: str) -> str:
 
 
 def _merge_two_tables(t1: str, t2: str) -> str:
+    """
+    Склеивает две pipe-markdown таблицы (продолжение через разрыв страницы).
+
+    Из второй таблицы удаляются: повтор хедера (если совпадает) и разделительная
+    строка ``| --- |`` — чтобы получить один непрерывный markdown.
+    """
     lines1 = [l for l in t1.splitlines() if l.strip()]
     lines2 = [l for l in t2.splitlines() if l.strip()]
     if not lines1 or not lines2:
@@ -808,6 +874,13 @@ def _merge_cross_page_tables(flat: list[tuple[str, str, int]]) -> list[str]:
 
 
 def _validate_text(text: str, ref_text: str) -> bool:
+    """
+    Анти-галлюцинационный фильтр для olmOCR-текста.
+
+    Отбрасываем, если:
+      * повтор одной строки > 50% (циклическая генерация VLM);
+      * исходный текст русский, а модель вывела почти чистый английский.
+    """
     if not text:
         return False
     if repetition_ratio(text) > 0.5:
@@ -818,6 +891,12 @@ def _validate_text(text: str, ref_text: str) -> bool:
 
 
 def _validate_table(md: str, ref_text: str) -> bool:
+    """
+    Структурная валидация markdown-таблицы.
+
+    Ориентиры: минимум 2 колонки, разумные размеры, нет дублирующихся строк
+    (признак VLM-галлюцинации), нет перевода RU→EN.
+    """
     if not md:
         return False
     stats = table_stats(md)
@@ -877,7 +956,7 @@ _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
 
 
 def _first_clean_line(text: str) -> str:
-    """Первая чистая строка (для alt)."""
+    """Первая содержательная строка текста (не markdown-разметка) — до 80 символов."""
     for line in text.splitlines():
         line = line.strip()
         if not line or _MD_IMAGE_LINE_RE.match(line):
@@ -889,7 +968,7 @@ def _first_clean_line(text: str) -> str:
 
 
 def _doc_id_from_name(stem: str) -> str:
-    """document_051 → '51' (без ведущих нулей)."""
+    """``document_051`` → ``'51'`` (без ведущих нулей)."""
     m = re.search(r"(\d+)", stem)
     if m:
         return str(int(m.group(1)))
@@ -898,26 +977,30 @@ def _doc_id_from_name(stem: str) -> str:
 
 def _postprocess_document(text: str) -> str:
     """
-    Rule-based чистка:
-      0. Вотермарки (ЧЕРНОВИК/DRAFT) в нетабличных строках.
-      1. Trailing whitespace.
-      2. 3+ пустых строки → 2.
-      3. Дубли соседних блоков.
-      4. Дубли соседних заголовков.
-      5. Нормализация уровней заголовков (min → #).
+    Rule-based чистка финального markdown.
+
+    Шаги:
+      -1. Убрать внутренние Docling-ссылки на картинки (``page_*.png``).
+       0. Водяные знаки (ЧЕРНОВИК/DRAFT/…) — в строках и внутри ячеек таблиц.
+       1. Trailing whitespace.
+       2. Свернуть прогоны пустых строк до максимум двух.
+       3. Дедупликация соседних блоков.
+      3.5. Переупорядочить ``![...]`` → ``Рис. N.`` → OCR-текст (если порядок
+           после OCR оказался перевёрнут).
+      3.6. Удалить ссылки на картинки без подписи «Рис. N.» — шум.
+       4. Дедупликация соседних заголовков.
     """
     if not text:
         return text
 
-    # -1. Убираем Docling-внутренние ссылки на изображения (page_N_N_N_N.png)
     text = _DOCLING_IMG_REF_RE.sub("", text)
 
-    # 0. Вотермарки (нетабличные строки и внутри ячеек таблиц)
+    # Водяные знаки. Внутри таблиц заменяем в ячейках, чтобы не ломать структуру;
+    # обычные строки-вотермарки выкидываем целиком.
     lines_wm = []
     for ln in text.splitlines():
         s = ln.strip()
         if s.startswith("|"):
-            # Чистим ЧЕРНОВИК/DRAFT из ячеек: | ЧЕРНОВИК | → |  |
             ln = re.sub(
                 r"(?<=\|)\s*(ЧЕРНОВИК|DRAFT|CONFIDENTIAL|КОНФИДЕНЦИАЛЬНО|НЕ\s+ДЛЯ\s+РАСПРОСТРАНЕНИЯ)\s*(?=\|)",
                 "  ",
@@ -932,10 +1015,8 @@ def _postprocess_document(text: str) -> str:
             lines_wm.append(ln)
     text = "\n".join(lines_wm)
 
-    # 1. Trailing whitespace
     lines = [ln.rstrip() for ln in text.splitlines()]
 
-    # 2. Blank runs
     cleaned: list[str] = []
     blank_run = 0
     for ln in lines:
@@ -948,7 +1029,6 @@ def _postprocess_document(text: str) -> str:
             cleaned.append(ln)
     text = "\n".join(cleaned)
 
-    # 3. Дубли соседних блоков
     blocks = text.split("\n\n")
     deduped: list[str] = []
     prev_block = None
@@ -961,8 +1041,7 @@ def _postprocess_document(text: str) -> str:
             prev_block = norm
     blocks = deduped
 
-    # 3.5. Перестановка: ![text/image](...) → OCR-текст → Рис. N.
-    #      → должно быть: ![text/image](...) → Рис. N. → OCR-текст
+    # OCR иногда подсовывает описание ДО подписи «Рис. N.» — исправляем порядок.
     _RIS_RE = re.compile(r"^Рис\s*\.\s*\d+", re.I | re.UNICODE)
     _IMG_BLOCK_RE = re.compile(r"^!\[(?:text|image)\]\(images/", re.I)
     reordered: list[str] = []
@@ -975,15 +1054,14 @@ def _postprocess_document(text: str) -> str:
             and not _RIS_RE.match(blocks[i + 1].strip())
             and _RIS_RE.match(blocks[i + 2].strip())
         ):
-            # Ставим Рис. перед OCR-текстом
             reordered.extend([blocks[i], blocks[i + 2], blocks[i + 1]])
             i += 3
         else:
             reordered.append(blocks[i])
             i += 1
 
-    # 3.6. Удаляем ссылки на картинки без Рис. после них — это шум/мусор
-    #      Правило: в этом наборе документов каждая значимая картинка имеет подпись Рис. N.
+    # В этом датасете у значимых картинок ВСЕГДА есть подпись «Рис. N.»;
+    # если её нет — это или шум, или поймана зря (логотип, декоративный элемент).
     filtered: list[str] = []
     i = 0
     while i < len(reordered):
@@ -991,15 +1069,13 @@ def _postprocess_document(text: str) -> str:
         if _IMG_BLOCK_RE.match(b):
             next_b = reordered[i + 1].strip() if i + 1 < len(reordered) else ""
             if _RIS_RE.match(next_b):
-                filtered.append(reordered[i])  # есть Рис. → оставляем картинку
-            # иначе ссылку выбрасываем; OCR-текст (если есть дальше) сохранится
+                filtered.append(reordered[i])
         else:
             filtered.append(reordered[i])
         i += 1
 
     text = "\n\n".join(filtered)
 
-    # 4. Дубли соседних заголовков
     lines = text.splitlines()
     result: list[str] = []
     prev_heading: Optional[str] = None
@@ -1015,25 +1091,6 @@ def _postprocess_document(text: str) -> str:
                 prev_heading = None
         result.append(ln)
     text = "\n".join(result)
-
-    # 5. Нормализация уровней
-    lines = text.splitlines()
-    min_level = 6
-    for ln in lines:
-        m = _HEADING_RE.match(ln)
-        if m:
-            min_level = min(min_level, len(m.group(1)))
-    if min_level > 1:
-        shift = min_level - 1
-        normalized: list[str] = []
-        for ln in lines:
-            m = _HEADING_RE.match(ln)
-            if m:
-                new_level = max(1, len(m.group(1)) - shift)
-                normalized.append("#" * new_level + " " + m.group(2))
-            else:
-                normalized.append(ln)
-        text = "\n".join(normalized)
 
     return text.strip()
 

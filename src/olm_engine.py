@@ -1,13 +1,17 @@
 """
-olmOCR-2-7B-1025 wrapper (AllenAI, Qwen2.5-VL базовая).
+olmOCR-2-7B-1025 wrapper (AllenAI, на базе Qwen2.5-VL-7B).
 
-Используется как fallback для sparse-страниц, где Docling не справился:
-скан без OCR-текста, сильно повреждённая страница, смешанный layout.
+Используется как fallback для двух сценариев:
+  * Docling вернул пустой/битый результат на блок (скан без OCR-слоя,
+    сильно повреждённая страница);
+  * определить содержимое figure-блока (таблица, текст, картинка).
 
 Требования:
-    torch>=2.5.1, transformers>=4.49, olmocr>=0.4 (для промпта)
-    GPU с ≥14GB VRAM для BF16 (4090 — 24GB, ок)
-    Опционально: flash-attn для ~2x speedup
+  * torch>=2.5.1, transformers>=4.49, olmocr>=0.4 (для промпта);
+  * GPU с ≥14GB VRAM для BF16 (4090 — 24GB);
+  * flash-attn — опционально, ~2× ускорение decode.
+
+Для детерминизма использованы ``temperature=0.1`` + ``do_sample=False``.
 """
 
 from __future__ import annotations
@@ -20,16 +24,16 @@ from typing import Optional
 
 from PIL import Image
 
+from config import OLM_RENDER_SIDE
 from device import is_cuda_available
 
 _MODEL_ID = "allenai/olmOCR-2-7B-1025"
 _PROCESSOR_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
-_MAX_SIDE = 1288
 _MAX_NEW_TOKENS = 4096
 
 
 def _resize_longest(img: Image.Image, max_side: int) -> Image.Image:
-    """Масштабирует изображение так, чтобы длинная сторона == max_side."""
+    """Масштабирует изображение так, чтобы длинная сторона == ``max_side``."""
     w, h = img.size
     longest = max(w, h)
     if longest == max_side:
@@ -40,6 +44,7 @@ def _resize_longest(img: Image.Image, max_side: int) -> Image.Image:
 
 
 def _pil_to_b64(img: Image.Image) -> str:
+    """PIL.Image → base64-PNG ASCII-строка для chat-template image_url."""
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("ascii")
@@ -49,7 +54,7 @@ _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", re.S)
 
 
 def _strip_yaml_frontmatter(text: str) -> str:
-    """olmOCR выдаёт YAML-метаданные + markdown; оставляем только markdown."""
+    """Убирает YAML-метаданные из ответа olmOCR, оставляя только markdown."""
     m = _FRONTMATTER_RE.match(text.strip())
     if m:
         return m.group(2).strip()
@@ -57,21 +62,24 @@ def _strip_yaml_frontmatter(text: str) -> str:
 
 
 class OLMEngine:
-    """Singleton для olmOCR-2-7B через transformers."""
+    """Singleton-обёртка над olmOCR-2-7B через HF transformers."""
 
     _instance: Optional["OLMEngine"] = None
 
     @classmethod
     def get(cls) -> "OLMEngine":
+        """Процесс-глобальный экземпляр; модель грузится лениво при первом вызове."""
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
 
     def __init__(self):
+        """Конструктор только регистрирует слоты; реальная загрузка — в ``_load``."""
         self._model = None
         self._processor = None
 
     def _load(self) -> None:
+        """Ленивая загрузка модели и процессора. Идемпотентна."""
         if self._model is not None:
             return
         if not is_cuda_available():
@@ -98,19 +106,23 @@ class OLMEngine:
 
     def page_to_markdown(self, pil_image: Image.Image) -> str:
         """
-        Обрабатывает страницу/блок. Возвращает markdown без YAML-frontmatter.
+        Распознаёт изображение → markdown (без YAML-frontmatter).
+
+        Изображение принудительно ресайзится к ``OLM_RENDER_SIDE`` (требование
+        модели). Параметры генерации детерминированы, чтобы одинаковый вход
+        давал одинаковый выход.
         """
         self._load()
         import torch
 
-        img = _resize_longest(pil_image, _MAX_SIDE)
+        img = _resize_longest(pil_image, OLM_RENDER_SIDE)
         b64 = _pil_to_b64(img)
 
         try:
             from olmocr.prompts import build_no_anchoring_v4_yaml_prompt
             prompt_text = build_no_anchoring_v4_yaml_prompt()
         except Exception:
-            # Fallback-промпт если olmocr не установлен/обновился
+            # Fallback-промпт на случай отсутствия пакета olmocr на сервере.
             prompt_text = (
                 "Attached is one page of a document. Return the full text and "
                 "tables as clean markdown. Preserve the original language. "
@@ -155,6 +167,7 @@ class OLMEngine:
         return _strip_yaml_frontmatter(raw)
 
     def release(self) -> None:
+        """Освобождает VRAM; полезно если далее идут не-GPU операции."""
         gc.collect()
         try:
             import torch
