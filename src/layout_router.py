@@ -7,7 +7,7 @@ Multi-scale inference (imgsz=1280 + imgsz=2400):
     и ширина/высота субтаблиц >=94.5%.
 
 NMS по IoM (intersection over min-area) с приоритетом класса:
-``title > section-header > table > figure > text``. Бокс выбрасывается,
+title > section-header > table > figure > text. Бокс выбрасывается,
 если >70% его площади перекрыто более приоритетным.
 
 Reading order:
@@ -17,7 +17,7 @@ Reading order:
   4. Внутри колонки — сверху-вниз.
 
 Также добавляем растровые объекты PDF, которые YOLO пропустил (по
-``page.get_image_info``) — в итоговый план как type=``picture``.
+page.get_image_info) — в итоговый план как type="picture".
 
 Возвращаемая структура:
     {
@@ -100,7 +100,7 @@ class LayoutRouter:
     """
     DocLayout-YOLOv10 + reading-order постобработка.
 
-    Одна публичная точка входа — ``build_routing_plan``. Модель подгружается
+    Одна публичная точка входа - build_routing_plan. Модель подгружается
     лениво при первом вызове (~400MB весов) и кэшируется в инстансе.
     """
 
@@ -142,7 +142,7 @@ class LayoutRouter:
         Args:
             pdf_path: путь к PDF.
             output_dir: база для вспомогательных файлов (визуализации и пр.).
-            visualize: если True, пишет в ``data/visualization/document_<id>/``
+            visualize: если True, пишет в "data/visualization/document_<id>/"
                 аннотированные PNG-страницы с индексами блоков.
 
         Returns:
@@ -378,7 +378,7 @@ class LayoutRouter:
         Band-based reading order для мульти-колоночных макетов.
 
         Пайплайн сортировки:
-          1. Логические блоки: медиа + ближайшая подпись склеиваются в один.
+          1. Логические блоки: медиа + ближайшая подпись склеивается в один.
           2. Полосы (bands): блоки с пересечением по Y (допуск 3% высоты
              страницы) объединяются в горизонтальные группы.
           3. Колонки внутри полос (overlap > 30% по X), слева-направо.
@@ -507,7 +507,16 @@ class LayoutRouter:
 
 
 def _ioa(box_small: list, box_large: list) -> float:
-    """Intersection over Area of box_small."""
+    """
+    Вычисляет Intersection over Area (IoA) относительно площади первого бокса.
+
+    Args:
+        box_small: Координаты первого (предположительно меньшего) бокса в формате [x1, y1, x2, y2].
+        box_large: Координаты второго (предположительно большего) бокса в формате [x1, y1, x2, y2].
+
+    Returns:
+        float: Доля площади перекрытия (от 0.0 до 1.0) относительно площади box_small.
+    """
     x1 = max(box_small[0], box_large[0])
     y1 = max(box_small[1], box_large[1])
     x2 = min(box_small[2], box_large[2])
@@ -520,7 +529,17 @@ def _ioa(box_small: list, box_large: list) -> float:
 
 
 def _is_image_noisy(gray: np.ndarray, threshold: int = 5000) -> bool:
-    """True если страница содержит >threshold точечных артефактов (пыль сканера)."""
+    """
+    Определяет, содержит ли страница большое количество точечных артефактов (шум/пыль).
+
+    Args:
+        gray: Изображение страницы в оттенках серого.
+        threshold: Порог количества мелких компонент связности (площадью <= 10 пикселей),
+            при превышении которого страница считается зашумленной.
+
+    Returns:
+        bool: True, если количество артефактов превышает threshold, иначе False.
+    """
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     _, _, stats, _ = cv2.connectedComponentsWithStats(thresh, connectivity=8)
     areas = stats[:, cv2.CC_STAT_AREA]
@@ -528,7 +547,17 @@ def _is_image_noisy(gray: np.ndarray, threshold: int = 5000) -> bool:
 
 
 def _is_box_empty(coords: list[int], gray: np.ndarray) -> bool:
-    """True если внутри бокса нет реального контента (только фон или пыль)."""
+    """
+    Проверяет, является ли бокс пустым (содержит только фон или мелкую пыль).
+
+    Args:
+        coords: Координаты проверяемого бокса в формате [x1, y1, x2, y2].
+        gray: Исходное изображение страницы в оттенках серого.
+
+    Returns:
+        bool: True, если внутри бокса нет значимого контента (отсутствуют компоненты
+        связности площадью >= 35 пикселей), иначе False.
+    """
     x1, y1, x2, y2 = coords
     m = 5
     x1c = min(x1 + m, x2); y1c = min(y1 + m, y2)
@@ -605,7 +634,20 @@ def _find_missed_rasters(
 def _is_duplicate(
     coords: list[int], saved: list[list[int]], threshold: float = 0.85
 ) -> bool:
-    """True, если ``coords`` сильно пересекается (IoM > threshold) с уже сохранённым."""
+    """
+    Проверяет, является ли бокс дубликатом одного из уже сохраненных боксов.
+
+    Дубликатом считается бокс, чье пересечение с любым из сохраненных боксов
+    (Intersection over Min-Area, IoM) превышает заданный порог.
+
+    Args:
+        coords: Координаты проверяемого бокса в формате [x1, y1, x2, y2].
+        saved: Список координат уже сохраненных боксов.
+        threshold: Порог IoM, выше которого бокс считается дубликатом.
+
+    Returns:
+        bool: True, если бокс дублирует один из сохраненных, иначе False.
+    """
     for s in saved:
         x1 = max(coords[0], s[0]); y1 = max(coords[1], s[1])
         x2 = min(coords[2], s[2]); y2 = min(coords[3], s[3])
@@ -621,7 +663,19 @@ def _is_duplicate(
 def _visualize(
     img_cv2: np.ndarray, boxes: list, names: dict, vis_dir: str, page_num: int
 ) -> None:
-    """Сохраняет аннотированную страницу (bbox'ы + индекс + класс) для дебага."""
+    """
+    Сохраняет аннотированную страницу для дебага reading order и работы модели.
+
+    Отрисовывает поверх изображения bounding box'ы, их порядковые индексы
+    (после сортировки) и текстовые названия классов.
+
+    Args:
+        img_cv2: Исходное изображение страницы в формате BGR.
+        boxes: Список предсказаний (боксов) после NMS и сортировки.
+        names: Словарь маппинга числовых индексов классов в их строковые названия.
+        vis_dir: Директория для сохранения итогового изображения.
+        page_num: Номер текущей страницы (используется для имени файла).
+    """
     draw = img_cv2.copy()
     for idx, box in enumerate(boxes, 1):
         label = names[int(box.cls[0])].lower()
@@ -635,7 +689,18 @@ def _visualize(
 
 
 def _doc_id_from_name(stem: str) -> str:
-    """document_051 -> '51' (без ведущих нулей)."""
+    """
+    Извлекает числовой идентификатор документа из имени файла.
+
+    Ищет первую последовательность цифр в строке и возвращает её без ведущих нулей
+    (например, 'document_051' -> '51'). Если цифр нет, возвращает строку целиком.
+
+    Args:
+        stem: Имя файла без расширения.
+
+    Returns:
+        str: Извлеченный идентификатор или исходная строка.
+    """
     m = re.search(r"(\d+)", stem)
     return str(int(m.group(1))) if m else stem
 
