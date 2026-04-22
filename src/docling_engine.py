@@ -18,7 +18,7 @@ from device import is_cuda_available
 
 
 class DoclingEngine:
-    """Singleton-обёртка над ``docling.DocumentConverter``."""
+    """Singleton-обёртка над docling.DocumentConverter."""
 
     _instance: Optional["DoclingEngine"] = None
 
@@ -71,7 +71,7 @@ class DoclingEngine:
         print(f"  [Docling] ready ({device_name})")
 
     def convert(self, pdf_path: str):
-        """Конвертирует PDF и возвращает ``DoclingDocument`` (со всеми items)."""
+        """Конвертирует PDF и возвращает DoclingDocument (со всеми items)."""
         result = self._converter.convert(pdf_path)
         return result.document
 

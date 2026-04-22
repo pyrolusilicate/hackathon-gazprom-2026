@@ -7,7 +7,7 @@ Multi-scale inference (imgsz=1280 + imgsz=2400):
     и ширина/высота субтаблиц >=94.5%.
 
 NMS по IoM (intersection over min-area) с приоритетом класса:
-``title > section-header > table > figure > text``. Бокс выбрасывается,
+title > section-header > table > figure > text. Бокс выбрасывается,
 если >70% его площади перекрыто более приоритетным.
 
 Reading order:
@@ -17,7 +17,7 @@ Reading order:
   4. Внутри колонки — сверху-вниз.
 
 Также добавляем растровые объекты PDF, которые YOLO пропустил (по
-``page.get_image_info``) — в итоговый план как type=``picture``.
+page.get_image_info) — в итоговый план как type=picture.
 
 Возвращаемая структура:
     {
@@ -100,7 +100,7 @@ class LayoutRouter:
     """
     DocLayout-YOLOv10 + reading-order постобработка.
 
-    Одна публичная точка входа — ``build_routing_plan``. Модель подгружается
+    Одна публичная точка входа — build_routing_plan. Модель подгружается
     лениво при первом вызове (~400MB весов) и кэшируется в инстансе.
     """
 
@@ -142,7 +142,7 @@ class LayoutRouter:
         Args:
             pdf_path: путь к PDF.
             output_dir: база для вспомогательных файлов (визуализации и пр.).
-            visualize: если True, пишет в ``data/visualization/document_<id>/``
+            visualize: если True, пишет в data/visualization/document_<id>/
                 аннотированные PNG-страницы с индексами блоков.
 
         Returns:
@@ -334,7 +334,7 @@ class LayoutRouter:
         """
         NMS по IoM с приоритетом класса.
 
-        Бокс удаляется, если >``iom_threshold`` его площади перекрыто боксом
+        Бокс удаляется, если >iom_threshold его площади перекрыто боксом
         более высокого приоритета. Приоритет figure с низкой уверенностью
         принудительно занижаем, чтобы он не «съедал» текстовый блок поверх.
         """
@@ -553,7 +553,7 @@ def _find_missed_rasters(
     Находит растровые объекты PDF, которые YOLO пропустил.
 
     YOLO иногда не детектит мелкие/низкоконтрастные картинки в цифровом PDF;
-    PyMuPDF даёт их напрямую через ``page.get_image_info``. Мы добавляем
+    PyMuPDF даёт их напрямую через page.get_image_info. Мы добавляем
     только те, что НЕ поймал YOLO (IoA с существующим YOLO-боксом <=50%)
     и которые не дублируют уже сохранённые координаты.
     """
@@ -605,7 +605,7 @@ def _find_missed_rasters(
 def _is_duplicate(
     coords: list[int], saved: list[list[int]], threshold: float = 0.85
 ) -> bool:
-    """True, если ``coords`` сильно пересекается (IoM > threshold) с уже сохранённым."""
+    """True, если coords сильно пересекается (IoM > threshold) с уже сохранённым."""
     for s in saved:
         x1 = max(coords[0], s[0]); y1 = max(coords[1], s[1])
         x2 = min(coords[2], s[2]); y2 = min(coords[3], s[3])

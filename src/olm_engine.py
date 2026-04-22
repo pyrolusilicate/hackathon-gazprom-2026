@@ -11,7 +11,7 @@ olmOCR-2-7B-1025 wrapper (AllenAI, на базе Qwen2.5-VL-7B).
   - GPU с >=14GB VRAM для BF16;
   - flash-attn — опционально, ~2 ускорение decode.
 
-Для детерминизма использованы ``temperature=0.1`` + ``do_sample=False``.
+Для детерминизма использованы temperature=0.1 + do_sample=False.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ _MAX_NEW_TOKENS = 4096
 
 
 def _resize_longest(img: Image.Image, max_side: int) -> Image.Image:
-    """Масштабирует изображение так, чтобы длинная сторона == ``max_side``."""
+    """Масштабирует изображение так, чтобы длинная сторона == max_side."""
     w, h = img.size
     longest = max(w, h)
     if longest == max_side:
@@ -74,7 +74,7 @@ class OLMEngine:
         return cls._instance
 
     def __init__(self):
-        """Конструктор только регистрирует слоты; реальная загрузка — в ``_load``."""
+        """Конструктор только регистрирует слоты; реальная загрузка — в _load."""
         self._model = None
         self._processor = None
 
@@ -108,7 +108,7 @@ class OLMEngine:
         """
         Распознаёт изображение -> markdown (без YAML-frontmatter).
 
-        Изображение принудительно ресайзится к ``OLM_RENDER_SIDE`` (требование
+        Изображение принудительно ресайзится к OLM_RENDER_SIDE (требование
         модели). Параметры генерации детерминированы, чтобы одинаковый вход
         давал одинаковый выход.
         """

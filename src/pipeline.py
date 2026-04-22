@@ -130,7 +130,7 @@ class Pipeline:
 
     def process_pdf(self, pdf_path: str) -> str:
         """
-        Обрабатывает один PDF и пишет ``<stem>.md`` в ``self.output_dir``.
+        Обрабатывает один PDF и пишет <stem>.md в self.output_dir.
 
         Пайплайн: YOLO routing -> Docling convert -> per-block match/fallback ->
         склейка cross-page таблиц -> rule-based post-processing.
