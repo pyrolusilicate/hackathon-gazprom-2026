@@ -357,8 +357,10 @@ class LayoutRouter:
             dominated = False
             for kb in kept:
                 kx1, ky1, kx2, ky2 = kb.xyxy[0].tolist()
-                ix1 = max(x1, kx1); iy1 = max(y1, ky1)
-                ix2 = min(x2, kx2); iy2 = min(y2, ky2)
+                ix1 = max(x1, kx1)
+                iy1 = max(y1, ky1)
+                ix2 = min(x2, kx2)
+                iy2 = min(y2, ky2)
                 if ix2 <= ix1 or iy2 <= iy1:
                     continue
                 inter = (ix2 - ix1) * (iy2 - iy1)
@@ -531,8 +533,10 @@ def _is_box_empty(coords: list[int], gray: np.ndarray) -> bool:
     """True если внутри бокса нет реального контента (только фон или пыль)."""
     x1, y1, x2, y2 = coords
     m = 5
-    x1c = min(x1 + m, x2); y1c = min(y1 + m, y2)
-    x2c = max(x1, x2 - m); y2c = max(y1, y2 - m)
+    x1c = min(x1 + m, x2)
+    y1c = min(y1 + m, y2)
+    x2c = max(x1, x2 - m)
+    y2c = max(y1, y2 - m)
     crop = gray[y1c:y2c, x1c:x2c]
     if crop.size == 0 or crop.shape[0] < 5 or crop.shape[1] < 5:
         return True
@@ -607,8 +611,10 @@ def _is_duplicate(
 ) -> bool:
     """True, если coords сильно пересекается (IoM > threshold) с уже сохранённым."""
     for s in saved:
-        x1 = max(coords[0], s[0]); y1 = max(coords[1], s[1])
-        x2 = min(coords[2], s[2]); y2 = min(coords[3], s[3])
+        x1 = max(coords[0], s[0])
+        y1 = max(coords[1], s[1])
+        x2 = min(coords[2], s[2])
+        y2 = min(coords[3], s[3])
         if x2 > x1 and y2 > y1:
             inter = (x2 - x1) * (y2 - y1)
             a1 = (coords[2] - coords[0]) * (coords[3] - coords[1])

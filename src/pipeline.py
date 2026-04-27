@@ -525,16 +525,16 @@ def _build_docling_index(doc) -> dict[int, list[tuple]]:
         if bbox is None:
             return None, None, None
         page_no = getattr(prov, "page_no", None)
-        l = float(getattr(bbox, "l", 0.0))
-        t = float(getattr(bbox, "t", 0.0))
-        r = float(getattr(bbox, "r", 0.0))
-        b = float(getattr(bbox, "b", 0.0))
+        l_w = float(getattr(bbox, "l", 0.0))
+        t_w = float(getattr(bbox, "t", 0.0))
+        r_w = float(getattr(bbox, "r", 0.0))
+        b_w = float(getattr(bbox, "b", 0.0))
         origin_attr = getattr(bbox, "coord_origin", None)
         origin_val = str(origin_attr).upper() if origin_attr is not None else "TOPLEFT"
         origin = "bottom" if "BOTTOM" in origin_val else "top"
         # В BOTTOMLEFT b > t; в TOPLEFT t < b. Нормализуем порядок:
-        y_low, y_high = (min(t, b), max(t, b))
-        return page_no, (l, y_low, r, y_high), origin
+        y_low, y_high = (min(t_w, b_w), max(t_w, b_w))
+        return page_no, (l_w, y_low, r_w, y_high), origin
 
     # Тексты
     for item in getattr(doc, "texts", None) or []:
@@ -744,8 +744,8 @@ def _merge_two_tables(t1: str, t2: str) -> str:
     Из второй таблицы удаляются: повтор хедера (если совпадает) и разделительная
     строка "| --- |" - чтобы получить один непрерывный markdown.
     """
-    lines1 = [l for l in t1.splitlines() if l.strip()]
-    lines2 = [l for l in t2.splitlines() if l.strip()]
+    lines1 = [line for line in t1.splitlines() if line.strip()]
+    lines2 = [line for line in t2.splitlines() if line.strip()]
     if not lines1 or not lines2:
         return (t1 + "\n\n" + t2).strip()
 
@@ -953,8 +953,10 @@ def _as_list_if_needed(lines: list[str] | str) -> str:
 
         # Умная генерация отступа, если движок съел пробелы, но оставил спецсимволы
         if not indent:
-            if clean_line.startswith('◦'): indent = "  "
-            elif clean_line.startswith('▪') or clean_line.startswith('▸'): indent = "    "
+            if clean_line.startswith('◦'):
+                indent = "  "
+            elif clean_line.startswith('▪') or clean_line.startswith('▸'):
+                indent = "    "
 
         # Нормализуем маркер в "- " с сохранением отступа
         result.append(f"{indent}- {clean_line[2:]}")
